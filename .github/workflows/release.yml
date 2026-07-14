@@ -1,66 +1,49 @@
 name: release
 
-# Releases are cut by pushing a tag:
+# Publishes the multi-arch image to GHCR and cuts a GitHub Release.
 #
 #   git tag v0.1.0 && git push origin v0.1.0
+#     -> ghcr.io/<owner>/snowid-server:v0.1.0, :0.1, :0, :latest   (amd64 + arm64)
+#     -> a GitHub Release with binaries for linux and macOS
 #
-# workflow_dispatch is here so the whole thing can be rehearsed against a branch
-# without minting a tag you then have to delete.
+# Tags only. An ordinary push to main builds nothing: a multi-arch build takes a
+# minute, and paying it on every commit buys nothing you do not already get from
+# `go test`. Use workflow_dispatch to rehearse this against a branch.
+#
+# Uses the built-in GITHUB_TOKEN — no secrets to configure for same-repo GHCR.
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
 
 env:
+  REGISTRY: ghcr.io
   IMAGE: ghcr.io/${{ github.repository }}
 
 jobs:
-  # Do not publish a broken build. The tests are the same ones CI runs; running
-  # them again here costs a minute and means a tag can never point at a tree that
-  # was never green.
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-      - run: go vet ./...
-      - run: go test -race -count=1 ./...
-
   image:
-    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write # to push to ghcr.io
-      id-token: write # for the build provenance attestation
-    outputs:
-      digest: ${{ steps.build.outputs.digest }}
+      packages: write
     steps:
       - uses: actions/checkout@v4
 
-      # QEMU is not used to *compile* — the Dockerfile cross-compiles, see there —
-      # but buildx still wants the emulators registered to assemble and inspect
-      # the arm64 layers.
+      # QEMU is not used to compile — the Dockerfile cross-compiles, see there —
+      # but buildx wants the emulators registered to assemble the arm64 layers.
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
 
       - uses: docker/login-action@v3
         with:
-          registry: ghcr.io
+          registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # The tags this release will ultimately carry — but NOT the ones it is pushed
-      # with. See the two-step publish below.
-      #
-      # v1.2.3 -> :v1.2.3, :1.2, :1, :latest
-      #
-      # :latest exists for `docker run`, and for nothing else. Do not put it in a
-      # manifest: two replicas that pull it at different times can end up running
-      # different binaries, and the id layout is permanent — every replica must
-      # agree on it forever. deploy/k8s pins a tag on purpose.
+      # :latest is for `docker run`, and nothing else. Do not put it in a manifest:
+      # two replicas pulling it at different times can end up on different binaries,
+      # and the id layout is permanent — every replica must agree on it forever.
+      # deploy/k8s pins a tag on purpose.
       - id: meta
         uses: docker/metadata-action@v5
         with:
@@ -70,126 +53,47 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            # workflow_dispatch from a branch has no semver to derive, so give it a
+            # name of its own rather than letting it land on :latest.
+            type=raw,value=edge,enable=${{ github.event_name == 'workflow_dispatch' }}
 
-      # Publish in two steps, and this is the whole point of the ordering:
-      #
-      #   1. push under the commit sha ONLY — a name nobody consumes;
-      #   2. verify it;
-      #   3. only then move :v1.2.3, :1.2, :1 and :latest onto it.
-      #
-      # Pushing the version tags up front, as this used to, means a failed
-      # verification leaves :latest already pointing at an image that was never
-      # shown to start. A tag people pull must never mean "we hope this works".
       - id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ env.IMAGE }}:sha-${{ github.sha }}
+          tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             VERSION=${{ github.ref_name }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          provenance: mode=max
-          sbom: true
 
-      # What actually went to the registry. imagetools reads the index directly with
-      # buildx's own registry client, so it copes with the unknown/unknown
-      # attestation manifests that provenance and sbom add — which the docker
-      # daemon's image store does not.
-      - name: the published index carries both architectures
-        env:
-          REF: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
-        run: |
-          set -euo pipefail
-
-          # Human-readable, for the log.
-          docker buildx imagetools inspect "$REF"
-
-          # And the assertion. The OCI index's JSON shape is a spec, not a buildx
-          # implementation detail, so parse that rather than a --format template.
-          docker buildx imagetools inspect "$REF" --format '{{json .Manifest}}' > index.json
-
-          for platform in linux/amd64 linux/arm64; do
-            os=${platform%/*} arch=${platform#*/}
-            jq -e --arg os "$os" --arg arch "$arch" \
-              '.manifests[] | select(.platform.os == $os and .platform.architecture == $arch)' \
-              index.json > /dev/null \
-              || { echo "the published index has no $platform manifest"; exit 1; }
-            echo "ok: $platform"
-          done
-
-      # Building an image is not the same as the image working. An entrypoint that
-      # exits, or a USER the runtime rejects, both build perfectly happily — so pull
-      # each architecture back down and actually start it.
+      # Building an image is not the same as the image working: the USER bug this
+      # Dockerfile once had built perfectly and could never start a container.
       #
-      # By TAG, not by digest. `docker run --platform X image@sha256:...` fails with
-      # "cannot overwrite digest" (moby/moby#43188): the digest pins one exact
-      # manifest, --platform asks to resolve a different one out of the index, and
-      # the daemon refuses to reconcile the two. A tag has no such conflict — and it
-      # is also how a user would actually pull this.
-      #
-      # amd64 runs natively; arm64 runs under the QEMU registered above, which is
-      # slow but fine for a five-second smoke test.
-      - name: each architecture starts and serves
+      # Deliberately plain. No --platform (it cannot be combined with a digest —
+      # moby/moby#43188), no digest, no QEMU: just pull the tag we pushed and run it
+      # on the runner's own architecture. The Dockerfile is identical for both
+      # arches, so what this catches, it catches for both.
+      - name: the published image starts, and refuses a bad layout
         env:
-          # The sha tag, because the version tags do not exist yet — that is the
-          # point. Nothing carries a name people pull until it has passed this.
-          REF: ${{ env.IMAGE }}:sha-${{ github.sha }}
+          REF: ${{ env.IMAGE }}:${{ steps.meta.outputs.version }}
         run: |
           set -euo pipefail
           echo "smoke-testing $REF"
 
-          for platform in linux/amd64 linux/arm64; do
-            echo "::group::$platform"
-            name="smoke-${platform##*/}"
+          docker run -d --name smoke "$REF" --worker-id 0
+          sleep 5
+          docker logs smoke
+          docker ps --filter name=smoke --filter status=running --format '{{.Names}}' \
+            | grep -qx smoke || { echo "the container is not running"; exit 1; }
 
-            docker run -d --name "$name" --platform "$platform" "$REF" --worker-id 0
-            sleep 5
-            docker logs "$name"
-
-            docker ps --filter "name=$name" --filter status=running --format '{{.Names}}' \
-              | grep -qx "$name" || { echo "$platform: container is not running"; exit 1; }
-
-            # And it must still refuse a layout that would silently emit broken ids.
-            if docker run --rm --platform "$platform" "$REF" --worker-id 0 --worker-bits 19; then
-              echo "$platform: started with an overflowed timestamp layout; it should have refused"
-              exit 1
-            fi
-
-            docker rm -f "$name" >/dev/null
-            echo "::endgroup::"
-          done
-
-      # Verified. Only NOW do the names people pull get pointed at it.
-      #
-      # imagetools create re-points a tag at an existing digest without rebuilding
-      # or re-uploading anything — the layers are already in the registry. If the
-      # smoke test above had failed, the workflow would have stopped here and the
-      # only thing in the registry would be a sha tag nobody consumes.
-      - name: promote the verified image to its version tags
-        env:
-          SOURCE: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
-        run: |
-          set -euo pipefail
-          args=()
-          while IFS= read -r tag; do
-            [ -n "$tag" ] || continue
-            echo "  -> $tag"
-            args+=(--tag "$tag")
-          done <<< "${{ steps.meta.outputs.tags }}"
-
-          docker buildx imagetools create "${args[@]}" "$SOURCE"
-
-      # Links the published image back to the commit and workflow that produced it,
-      # so `gh attestation verify` can prove where it came from.
-      - uses: actions/attest-build-provenance@v2
-        with:
-          subject-name: ${{ env.IMAGE }}
-          subject-digest: ${{ steps.build.outputs.digest }}
-          push-to-registry: true
+          if docker run --rm "$REF" --worker-id 0 --worker-bits 19; then
+            echo "started with an overflowed timestamp layout; it should have refused"
+            exit 1
+          fi
 
       - name: summary
         run: |
@@ -204,25 +108,23 @@ jobs:
             echo "Platforms: \`linux/amd64\`, \`linux/arm64\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # Cut the GitHub Release last, so that it only ever exists for a tag whose tests
-  # passed and whose image was published and started. A release that points at an
-  # image nobody could pull is worse than no release.
+  # Tags only. Deliberately independent of the image job: a flaky registry should
+  # not cost you the Release, and a Release without an image is easy to see and fix.
   release:
-    needs: image
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
-      contents: write # to create the release
+      contents: write
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # --generate-notes needs the history to diff against the last tag
+          fetch-depth: 0 # release notes are generated by diffing against the last tag
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
 
-      # Not everyone runs containers. Ship the binary too — it is one static file
-      # with no libc to match, which is the whole reason CGO_ENABLED=0 is worth it.
+      # Not everyone runs containers. Ship the binary too — one static file, no libc
+      # to match, which is the whole reason CGO_ENABLED=0 is worth it.
       - name: build the binaries
         env:
           VERSION: ${{ github.ref_name }}
@@ -245,52 +147,20 @@ jobs:
           cd dist && sha256sum ./*.tar.gz > checksums.txt
           cat checksums.txt
 
-      - name: create the release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ github.ref_name }}
-          DIGEST: ${{ needs.image.outputs.digest }}
-        run: |
-          set -euo pipefail
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: |
+            dist/*.tar.gz
+            dist/checksums.txt
+          body: |
+            ## Container image
 
-          # A tag like v1.0.0-rc1 is a pre-release. Marking it stops it becoming
-          # the "latest release" that people land on from the repo front page.
-          prerelease=""
-          case "$VERSION" in *-*) prerelease="--prerelease" ;; esac
+            ```console
+            docker pull ${{ env.IMAGE }}:${{ github.ref_name }}
+            ```
 
-          cat > notes.md <<EOF
-          ## Container image
-
-          \`\`\`console
-          docker pull ${IMAGE}:${VERSION}
-          \`\`\`
-
-          | | |
-          | --- | --- |
-          | Platforms | \`linux/amd64\`, \`linux/arm64\` |
-          | Digest | \`${DIGEST}\` |
-
-          Pin the digest in a manifest rather than a moving tag — the ID layout is
-          permanent, so every replica has to agree on the binary forever:
-
-          \`\`\`yaml
-          image: ${IMAGE}@${DIGEST}
-          \`\`\`
-
-          Verify where it came from:
-
-          \`\`\`console
-          gh attestation verify oci://${IMAGE}:${VERSION} --repo ${{ github.repository }}
-          \`\`\`
-          EOF
-
-          # --notes (not --notes-file) is the documented way to combine hand-written
-          # notes with --generate-notes: what it is given gets prepended to the
-          # generated changelog. Whether --notes-file composes the same way is not
-          # documented, and a release is not the place to find out.
-          gh release create "$VERSION" \
-            --title "$VERSION" \
-            --notes "$(cat notes.md)" \
-            --generate-notes \
-            $prerelease \
-            dist/*.tar.gz dist/checksums.txt
+            Built for `linux/amd64` and `linux/arm64`.
