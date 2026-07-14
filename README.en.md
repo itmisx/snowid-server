@@ -390,7 +390,6 @@ Published to the GitHub Container Registry for **both `linux/amd64` and `linux/a
 
 ```bash
 docker pull ghcr.io/itmisx/snowid-server:v0.1.0
-# ghcr.io/itmisx/snowid-server:0.1.0 works too — both spellings are published
 ```
 
 The image is **distroless**: one static binary, no shell, no package manager, running non-root as
@@ -421,7 +420,7 @@ git push origin v0.1.0
 
 1. Builds `linux/amd64` and `linux/arm64` with buildx. Go **cross-compiles**; QEMU never runs the
    compiler, which is an order of magnitude faster.
-2. Pushes to `ghcr.io` as `v0.1.0` / `0.1.0` / `v0.1` / `0.1` / `v0` / `0` / `latest`.
+2. Pushes to `ghcr.io` as **`v0.1.0`** — spelled exactly as the git tag — and `latest`.
 3. **Pulls the image back down and actually starts it** — building is not working.
 4. Cuts a GitHub Release with binaries for four platforms and a `checksums.txt`.
 

@@ -372,7 +372,6 @@ env:
 
 ```bash
 docker pull ghcr.io/itmisx/snowid-server:v0.1.0
-# ghcr.io/itmisx/snowid-server:0.1.0 也行 —— 带 v 和不带 v 的 tag 都会发布
 ```
 
 镜像基于 **distroless**：一个静态二进制，没有 shell、没有包管理器，以 UID 65532 **非 root** 运行。
@@ -400,7 +399,7 @@ git push origin v0.1.0
 [`release.yml`](.github/workflows/release.yml) 会：
 
 1. 用 buildx 构建 `linux/amd64` + `linux/arm64`（Go **交叉编译**，不走 QEMU，快一个数量级）
-2. 推到 `ghcr.io`，打上 `v0.1.0` / `0.1.0` / `v0.1` / `0.1` / `v0` / `0` / `latest`
+2. 推到 `ghcr.io`，打上 **`v0.1.0`**（和 git tag 完全一致）和 `latest`
 3. **把镜像拉回来真的跑一遍**——能构建 ≠ 能启动
 4. 创建 GitHub Release，附上四个平台的二进制和 `checksums.txt`
 
