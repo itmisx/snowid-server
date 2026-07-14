@@ -3,7 +3,7 @@ name: release
 # Publishes the multi-arch image to GHCR and cuts a GitHub Release.
 #
 #   git tag v0.1.0 && git push origin v0.1.0
-#     -> ghcr.io/<owner>/snowid-server:v0.1.0, :0.1, :0, :latest   (amd64 + arm64)
+#     -> ghcr.io/<owner>/snowid-server:v0.1.0 and :0.1.0 (plus :0.1, :0, :latest), amd64 + arm64
 #     -> a GitHub Release with binaries for linux and macOS
 #
 # Tags only. An ordinary push to main builds nothing: a multi-arch build takes a
@@ -40,10 +40,23 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # :latest is for `docker run`, and nothing else. Do not put it in a manifest:
+      # Both spellings, because there is no one convention and a tag costs nothing:
+      # it is a pointer to a digest that is already there.
+      #
+      #   git tag v0.1.0  ->  :0.1.0 :0.1 :0      Docker's own (golang:1.26.5)
+      #                       :v0.1.0 :v0.1 :v0   Kubernetes' (prometheus:v2.20.0)
+      #                       :latest
+      #
+      # metadata-action's {{version}} STRIPS the v, because semver says the v is not
+      # part of the version. On its own that means `git tag v0.1.0` publishes an
+      # image called `0.1.0` — the git tag and the image tag never match, and a
+      # manifest pinning `:v0.1.0` pins a tag that does not exist. Publishing both
+      # ends the question.
+      #
+      # :latest is for `docker run` and nothing else. Do not put it in a manifest:
       # two replicas pulling it at different times can end up on different binaries,
       # and the id layout is permanent — every replica must agree on it forever.
-      # deploy/k8s pins a tag on purpose.
+      # deploy/k8s pins a version tag on purpose.
       - id: meta
         uses: docker/metadata-action@v5
         with:
@@ -52,6 +65,9 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
+            type=semver,pattern=v{{version}}
+            type=semver,pattern=v{{major}}.{{minor}}
+            type=semver,pattern=v{{major}}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
             # workflow_dispatch from a branch has no semver to derive, so give it a
             # name of its own rather than letting it land on :latest.
