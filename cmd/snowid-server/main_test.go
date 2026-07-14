@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -122,6 +123,49 @@ func TestValidateRejectsAnEpochInTheFuture(t *testing.T) {
 
 	if err := validate(0, 0, l, testNow); err == nil {
 		t.Fatal("an epoch in the future was accepted")
+	}
+}
+
+// The bit-budget table in the README, made executable.
+//
+// The two width flags ADD — the datacenter is not carved out of the worker — so
+// the bits for it come out of the TIMESTAMP unless you take them off the worker.
+// That is the trap: --datacenter-bits=5 on its own leaves 36 timestamp bits, which
+// ran out in 2022, and every ID after that would be silently wrong. It is exactly
+// the kind of thing a README says and the code stops doing, so pin it here.
+func TestBitBudget(t *testing.T) {
+	for _, tc := range []struct {
+		datacenterBits, workerBits uint8
+		wantIdentities             int64
+		wantTimestampBits          uint8
+		wantAccepted               bool
+	}{
+		{0, 10, 1024, 41, true},   // the default
+		{5, 5, 1024, 41, true},    // Twitter's split: same total, same lifespan
+		{3, 7, 1024, 41, true},    // any split of the same 10 bits
+		{5, 10, 32768, 36, false}, // forgot to take them off the worker
+		{0, snowflake.DefaultWorkerBits, 1024, 41, true},
+	} {
+		name := fmt.Sprintf("dc=%d/worker=%d", tc.datacenterBits, tc.workerBits)
+		t.Run(name, func(t *testing.T) {
+			l := layout(tc.datacenterBits, tc.workerBits)
+
+			if got := int64(1) << tc.datacenterBits * int64(1) << tc.workerBits; got != tc.wantIdentities {
+				t.Errorf("%d identities, README says %d", got, tc.wantIdentities)
+			}
+			if got := l.TimestampBits(); got != tc.wantTimestampBits {
+				t.Errorf("%d timestamp bits, README says %d", got, tc.wantTimestampBits)
+			}
+
+			err := validate(0, 0, l, testNow)
+			if accepted := err == nil; accepted != tc.wantAccepted {
+				if tc.wantAccepted {
+					t.Fatalf("rejected a layout the README says is fine: %v", err)
+				}
+				t.Fatal("accepted a layout whose timestamp overflowed in 2022; every id it " +
+					"issued from then on would be silently wrong")
+			}
+		})
 	}
 }
 

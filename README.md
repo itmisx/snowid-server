@@ -58,7 +58,7 @@ $ grpcurl -plaintext -d '{"count": 3}' localhost:50051 snowid.v1.SnowId/Next
 | --- | --- | --- | --- |
 | `--worker-id` | `SNOWID_WORKER_ID` | **必填** | 本机器在其机房内的 ID |
 | `--datacenter-id` | `SNOWID_DATACENTER_ID` | `0` | 本机房的 ID |
-| `--worker-bits` | | `10` | 机器段宽度：每个机房最多几台机器 |
+| `--worker-bits` | | `10` | 机器段宽度。`10` 位 = 每个机房最多 1024 台机器 |
 | `--datacenter-bits` | | `0` | 机房段宽度。`0` = 不分机房 |
 | `--epoch` | | `1577836800000` | 时间戳零点，**Unix 毫秒**（默认 2020-01-01 UTC） |
 | `--addr` | | `:50051` | gRPC 监听地址 |
@@ -71,9 +71,36 @@ $ snowid-server
 ERROR startup failed error="--worker-id is required: two live processes sharing an identity issue the same ids"
 ```
 
+### 位数预算：加机房位，就得减机器位
+
+64 位是**固定的**，最高位恒为 0，所以只有 63 位可分。序号段固定 12 位，剩下的**机房段、机器段
+和时间戳段在抢同一块地**：
+
+```
+时间戳位数 = 63 - 机房位数 - 机器位数 - 12
+```
+
+**两个位宽参数是相加的，不是「机房从机器里切一块」。** 所以只加 `--datacenter-bits` 而不减
+`--worker-bits`，是在从**时间戳**里偷位——ID 的可用年限会断崖式下跌：
+
+| `--datacenter-bits` | `--worker-bits` | 身份总数 | 时间戳位数 | 能用多久 |
+| --- | --- | --- | --- | --- |
+| `0`（默认） | `10` | 1024 | 41 | **69.7 年** ✅ |
+| `5` | `5` | 32 × 32 = 1024 | 41 | **69.7 年** ✅（Twitter 原版） |
+| `3` | `7` | 8 × 128 = 1024 | 41 | **69.7 年** ✅ |
+| `5` | **`10`** ← 忘了减 | 32 × 1024 = 32768 | 36 | **2.2 年** ❌ 从 2020 年算早就溢出 |
+
+最后那行**启动就会被拒绝**，不会让你带着一个两年就崩的布局跑起来：
+
+```console
+$ snowid-server --datacenter-bits 5 --worker-id 2 --datacenter-id 1
+ERROR startup failed error="--epoch=1577836800000 is too far in the past:
+      36 bits of timestamp hold only 19088h44m36.736s, and 57277h6m24.432s have passed since it"
+```
+
 ### 机房（datacenter）
 
-默认不分机房。要分的话，就是 Twitter 原版的 5/5 分法：
+默认不分机房。要分的话，就是 Twitter 原版的 5/5 分法——**注意 `--worker-bits` 要从 10 减到 5**：
 
 ```console
 $ snowid-server --datacenter-bits 5 --worker-bits 5 --datacenter-id 1 --worker-id 2
@@ -81,8 +108,8 @@ INFO generator ready worker_id=2 worker_bits=5 step_bits=12 max_workers=32 \
      datacenter_id=1 datacenter_bits=5 max_datacenters=32 ...
 ```
 
-**32 个机房 × 每机房 32 台机器 = 1024 个身份**，和默认的 10 位机器段总数一样——机房段是从这
-10 位里**切出来**的，不是额外加的。
+**32 个机房 × 每机房 32 台机器 = 1024 个身份**——总数和默认一样，时间戳也还是 41 位。你是把
+那 10 位身份**重新划分**了，不是凭空多要位。
 
 **两个 ID 在底层是「位拼接」，不是「相加」：**
 

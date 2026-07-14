@@ -71,7 +71,7 @@ func run(args []string) error {
 		workerID    = fs.Int64("worker-id", envWorker, "this worker's id within its datacenter; required, and no two live processes may share the same (datacenter, worker) pair [SNOWID_WORKER_ID]")
 		datacenter  = fs.Int64("datacenter-id", envDatacenter, "this datacenter's id [SNOWID_DATACENTER_ID]")
 		workerBits  = fs.Uint("worker-bits", uint(snowflake.DefaultWorkerBits), "width of the worker segment: how many workers there can be per datacenter; permanent once ids are issued")
-		datacenters = fs.Uint("datacenter-bits", uint(snowflake.DefaultDatacenterBits), "width of the datacenter segment; 0 means no datacenters; permanent once ids are issued")
+		datacenters = fs.Uint("datacenter-bits", uint(snowflake.DefaultDatacenterBits), "width of the datacenter segment; 0 means no datacenters. These bits ADD to --worker-bits and come out of the timestamp, so take them off the worker: 5+5 lasts as long as 0+10, but 5+10 expires in two years. Permanent once ids are issued")
 		epochMs     = fs.Int64("epoch", 1577836800000, "zero point of the id timestamp, in unix milliseconds; permanent once ids are issued")
 	)
 	if err := fs.Parse(args); err != nil {

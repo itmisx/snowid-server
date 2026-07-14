@@ -65,7 +65,7 @@ all 10 bits belong to the worker.
 | --- | --- | --- | --- |
 | `--worker-id` | `SNOWID_WORKER_ID` | **required** | This machine's ID within its datacenter |
 | `--datacenter-id` | `SNOWID_DATACENTER_ID` | `0` | This datacenter's ID |
-| `--worker-bits` | | `10` | Width of the worker segment: how many workers per datacenter |
+| `--worker-bits` | | `10` | Width of the worker segment. `10` bits = up to 1024 workers per datacenter |
 | `--datacenter-bits` | | `0` | Width of the datacenter segment. `0` = no datacenters |
 | `--epoch` | | `1577836800000` | Zero point of the timestamp, in **unix milliseconds** (2020-01-01 UTC) |
 | `--addr` | | `:50051` | gRPC listen address |
@@ -78,9 +78,40 @@ $ snowid-server
 ERROR startup failed error="--worker-id is required: two live processes sharing an identity issue the same ids"
 ```
 
+### The bit budget: add datacenter bits, take them off the worker
+
+There are 64 bits and no more. The top one stays 0, so 63 are yours to divide, and
+the step segment takes a fixed 12. The datacenter, the worker and **the timestamp are
+all competing for the same remainder**:
+
+```
+timestamp_bits = 63 - datacenter_bits - worker_bits - 12
+```
+
+**The two width flags ADD; the datacenter is not carved out of the worker.** So adding
+`--datacenter-bits` without taking the same off `--worker-bits` steals the bits from
+the *timestamp*, and the ID layout's lifespan falls off a cliff:
+
+| `--datacenter-bits` | `--worker-bits` | Identities | Timestamp bits | Lasts |
+| --- | --- | --- | --- | --- |
+| `0` (default) | `10` | 1024 | 41 | **69.7 years** ✅ |
+| `5` | `5` | 32 × 32 = 1024 | 41 | **69.7 years** ✅ (Twitter's) |
+| `3` | `7` | 8 × 128 = 1024 | 41 | **69.7 years** ✅ |
+| `5` | **`10`** ← forgot | 32 × 1024 = 32768 | 36 | **2.2 years** ❌ already overflowed |
+
+That last row is **refused at startup**. You do not get to run a layout that expired
+two years after its own epoch:
+
+```console
+$ snowid-server --datacenter-bits 5 --worker-id 2 --datacenter-id 1
+ERROR startup failed error="--epoch=1577836800000 is too far in the past:
+      36 bits of timestamp hold only 19088h44m36.736s, and 57277h6m24.432s have passed since it"
+```
+
 ### Datacenters
 
-Off by default. Turn them on and you get Twitter's original 5/5 split:
+Off by default. Turn them on and you get Twitter's original 5/5 split — note that
+`--worker-bits` comes **down** from 10 to 5:
 
 ```console
 $ snowid-server --datacenter-bits 5 --worker-bits 5 --datacenter-id 1 --worker-id 2
@@ -88,9 +119,9 @@ INFO generator ready worker_id=2 worker_bits=5 step_bits=12 max_workers=32 \
      datacenter_id=1 datacenter_bits=5 max_datacenters=32 ...
 ```
 
-**32 datacenters × 32 workers each = 1024 identities** — the same total as the default
-10-bit worker segment, because the datacenter segment is **carved out of it**, not
-added beside it.
+**32 datacenters × 32 workers each = 1024 identities** — the same total as the default,
+with the timestamp still on 41 bits. You have **re-divided** those 10 identity bits, not
+asked for more.
 
 **Underneath, the two IDs are CONCATENATED, not added:**
 
