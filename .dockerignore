@@ -1,0 +1,21 @@
+# Keep the build context to what the build actually needs.
+#
+# Without this, `COPY . .` drags .git and the docs into the image layer, so any
+# doc edit invalidates the cached `go mod download` — which is the one thing the
+# split COPY in the Dockerfile exists to protect. Excluding .git also stops the
+# toolchain stamping VCS state into the binary, which is what keeps -trimpath from
+# producing identical builds from identical sources.
+
+.git
+.github
+.gitignore
+.dockerignore
+
+deploy
+*.md
+LICENSE
+Makefile
+buf.gen.sh
+
+# Local build output.
+snowid-server

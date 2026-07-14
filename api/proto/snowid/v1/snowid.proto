@@ -1,0 +1,86 @@
+syntax = "proto3";
+
+package snowid.v1;
+
+option go_package = "github.com/itmisx/snowid-server/gen/snowid/v1;snowidv1";
+
+// SnowId hands out unique, roughly time-ordered 64-bit IDs.
+//
+// An ID packs, from the most significant bit down, exactly as Twitter's original
+// snowflake did:
+//
+//   | unused(1) | timestamp | datacenter | worker | step |
+//
+// The datacenter and worker segments together identify the process that made the
+// ID, and no two live processes may share that pair. datacenter_bits is normally
+// 0, which leaves the whole segment to the worker.
+//
+// The segment widths and the epoch are set at deploy time; call GetLayout to
+// learn them.
+service SnowId {
+  // Next returns `count` unique IDs, in ascending order.
+  rpc Next(NextRequest) returns (NextResponse) {}
+
+  // GetLayout returns the ID layout, so a client can decode IDs itself.
+  //
+  // Decoding is pure bit arithmetic; never call the server to read an ID's
+  // timestamp. Fetch the layout once at startup and decode locally:
+  //
+  //   unix_milli = (id >> (datacenter_bits + worker_bits + step_bits)) + epoch_unix_milli
+  //   datacenter = (id >> (worker_bits + step_bits)) & ((1 << datacenter_bits) - 1)
+  //   worker     = (id >> step_bits) & ((1 << worker_bits) - 1)
+  //   step       =  id & ((1 << step_bits) - 1)
+  rpc GetLayout(GetLayoutRequest) returns (GetLayoutResponse) {}
+}
+
+message NextRequest {
+  // How many IDs to return. Values <= 0 mean 1. Values above the server's
+  // configured maximum are rejected with INVALID_ARGUMENT rather than
+  // silently truncated.
+  int32 count = 1;
+}
+
+message NextResponse {
+  // "node_id" is gone: it said which process made these IDs, and every ID
+  // already carries that — decode it with the layout. See GetLayoutResponse.
+  reserved 2;
+  reserved "node_id";
+
+  // The generated IDs, ascending.
+  //
+  // Sent as int64. Beware that JSON and JavaScript cannot hold a 64-bit integer
+  // exactly — carry IDs as strings across those boundaries.
+  repeated int64 ids = 1;
+}
+
+message GetLayoutRequest {}
+
+message GetLayoutResponse {
+  // "node_bits" and "node_id" are gone. "node" meant two different things — the
+  // whole datacenter+worker segment, and the worker within a datacenter — which
+  // is exactly the confusion this rename removes. Use worker_bits and worker_id.
+  reserved 2, 4;
+  reserved "node_bits", "node_id";
+
+  // Zero point of the timestamp segment, in Unix milliseconds.
+  int64 epoch_unix_milli = 1;
+
+  // Width of the step segment, in bits: how many IDs one worker can issue within
+  // one millisecond.
+  int32 step_bits = 3;
+
+  // The largest `count` Next will accept.
+  int32 max_batch = 5;
+
+  // Width of the datacenter segment, in bits. Zero — the usual case — means
+  // there are no datacenters, and datacenter_id is always 0.
+  int32 datacenter_bits = 6;
+
+  // Width of the worker segment, in bits.
+  int32 worker_bits = 7;
+
+  // The datacenter and worker this server runs as. Together they are its
+  // identity, and no two live processes may share it.
+  int64 datacenter_id = 8;
+  int64 worker_id = 9;
+}

@@ -1,0 +1,229 @@
+name: release
+
+# Releases are cut by pushing a tag:
+#
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# workflow_dispatch is here so the whole thing can be rehearsed against a branch
+# without minting a tag you then have to delete.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  # Do not publish a broken build. The tests are the same ones CI runs; running
+  # them again here costs a minute and means a tag can never point at a tree that
+  # was never green.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - run: go test -race -count=1 ./...
+
+  image:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # to push to ghcr.io
+      id-token: write # for the build provenance attestation
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # QEMU is not used to *compile* — the Dockerfile cross-compiles, see there —
+      # but buildx still wants the emulators registered to assemble and inspect
+      # the arm64 layers.
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # v1.2.3 -> :v1.2.3, :1.2, :1, :latest
+      #
+      # :latest exists for `docker run`, and for nothing else. Do not put it in a
+      # manifest: two replicas that pull it at different times can end up running
+      # different binaries, and the id layout is permanent — every replica must
+      # agree on it forever. deploy/k8s pins a tag on purpose.
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=sha,format=long
+
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ github.ref_name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: mode=max
+          sbom: true
+
+      # Building an image is not the same as the image working. An entrypoint that
+      # exits, or a USER the runtime rejects, both build perfectly happily — so
+      # pull each architecture back down and actually start it.
+      #
+      # amd64 runs natively; arm64 runs under the QEMU registered above, which is
+      # slow but fine for a three-second smoke test.
+      - name: each architecture starts and serves
+        run: |
+          set -euo pipefail
+          for platform in linux/amd64 linux/arm64; do
+            echo "::group::$platform"
+            name="smoke-${platform##*/}"
+
+            docker run -d --name "$name" --platform "$platform" \
+              "${IMAGE}@${{ steps.build.outputs.digest }}" --worker-id 0
+            sleep 5
+            docker logs "$name"
+
+            docker ps --filter "name=$name" --filter status=running --format '{{.Names}}' \
+              | grep -qx "$name" || { echo "$platform: container is not running"; exit 1; }
+
+            # And it must still refuse a layout that would silently emit broken ids.
+            if docker run --rm --platform "$platform" \
+                 "${IMAGE}@${{ steps.build.outputs.digest }}" --worker-id 0 --worker-bits 19; then
+              echo "$platform: started with an overflowed timestamp layout; it should have refused"
+              exit 1
+            fi
+
+            docker rm -f "$name" >/dev/null
+            echo "::endgroup::"
+          done
+
+      # Links the published image back to the commit and workflow that produced it,
+      # so `gh attestation verify` can prove where it came from.
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: summary
+        run: |
+          {
+            echo "### Published"
+            echo
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+            echo
+            echo "Digest: \`${{ steps.build.outputs.digest }}\`"
+            echo "Platforms: \`linux/amd64\`, \`linux/arm64\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Cut the GitHub Release last, so that it only ever exists for a tag whose tests
+  # passed and whose image was published and started. A release that points at an
+  # image nobody could pull is worse than no release.
+  release:
+    needs: image
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # to create the release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # --generate-notes needs the history to diff against the last tag
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # Not everyone runs containers. Ship the binary too — it is one static file
+      # with no libc to match, which is the whole reason CGO_ENABLED=0 is worth it.
+      - name: build the binaries
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            os=${target%/*} arch=${target#*/}
+            name="snowid-server_${VERSION}_${os}_${arch}"
+
+            CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath \
+              -ldflags "-s -w -X main.version=${VERSION}" \
+              -o "dist/${name}/snowid-server" ./cmd/snowid-server
+
+            cp LICENSE README.md "dist/${name}/"
+            tar -C dist -czf "dist/${name}.tar.gz" "$name"
+            rm -rf "dist/${name:?}"
+          done
+
+          cd dist && sha256sum ./*.tar.gz > checksums.txt
+          cat checksums.txt
+
+      - name: create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ github.ref_name }}
+          DIGEST: ${{ needs.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+
+          # A tag like v1.0.0-rc1 is a pre-release. Marking it stops it becoming
+          # the "latest release" that people land on from the repo front page.
+          prerelease=""
+          case "$VERSION" in *-*) prerelease="--prerelease" ;; esac
+
+          cat > notes.md <<EOF
+          ## Container image
+
+          \`\`\`console
+          docker pull ${IMAGE}:${VERSION}
+          \`\`\`
+
+          | | |
+          | --- | --- |
+          | Platforms | \`linux/amd64\`, \`linux/arm64\` |
+          | Digest | \`${DIGEST}\` |
+
+          Pin the digest in a manifest rather than a moving tag — the ID layout is
+          permanent, so every replica has to agree on the binary forever:
+
+          \`\`\`yaml
+          image: ${IMAGE}@${DIGEST}
+          \`\`\`
+
+          Verify where it came from:
+
+          \`\`\`console
+          gh attestation verify oci://${IMAGE}:${VERSION} --repo ${{ github.repository }}
+          \`\`\`
+          EOF
+
+          # --notes (not --notes-file) is the documented way to combine hand-written
+          # notes with --generate-notes: what it is given gets prepended to the
+          # generated changelog. Whether --notes-file composes the same way is not
+          # documented, and a release is not the place to find out.
+          gh release create "$VERSION" \
+            --title "$VERSION" \
+            --notes "$(cat notes.md)" \
+            --generate-notes \
+            $prerelease \
+            dist/*.tar.gz dist/checksums.txt

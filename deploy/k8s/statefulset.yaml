@@ -1,0 +1,119 @@
+# A StatefulSet, and each pod gets its worker id from its own ordinal.
+#
+# Two live processes sharing an identity issue the same ids, so the worker id is
+# the one thing that must never be guessed. This manifest does not guess: it reads
+# the ordinal straight out of the label the StatefulSet controller stamps on each
+# pod.
+#
+#   snowid-0 -> apps.kubernetes.io/pod-index: "0" -> SNOWID_WORKER_ID=0
+#   snowid-1 -> apps.kubernetes.io/pod-index: "1" -> SNOWID_WORKER_ID=1
+#
+# Kubernetes guarantees at most one pod holds a given ordinal at any moment — a
+# rolling update terminates snowid-0 before recreating it, never overlapping — so
+# the id is unique and stable across restarts with no external coordination.
+#
+# Run this same spec as a DEPLOYMENT and it fails closed, on purpose: a Deployment
+# sets no pod-index label, the downward API yields "", and the server refuses to
+# start rather than invent a worker id. That is the correct outcome.
+#
+# Requires Kubernetes 1.28+ for the pod-index label (beta and on by default there,
+# GA in 1.32). On older clusters, set --worker-id yourself — one StatefulSet per id.
+#
+# With the default 10 worker bits you can run up to 1024 replicas. One replica
+# already serves 4,096,000 ids/second, so replicas are about resilience, not
+# throughput.
+apiVersion: v1
+kind: Service
+metadata:
+  name: snowid
+spec:
+  # Headless: DNS resolves to the pod IPs, so gRPC clients can round-robin across
+  # replicas and drop a failed one on their own.
+  clusterIP: None
+  selector:
+    app: snowid
+  ports:
+    - name: grpc
+      port: 50051
+      targetPort: grpc
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: snowid
+spec:
+  serviceName: snowid
+  replicas: 3
+  selector:
+    matchLabels:
+      app: snowid
+  # Pods keep their identity across a rolling update: snowid-1 is terminated and
+  # recreated as snowid-1, so no two live pods ever hold the same worker id.
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: snowid
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: snowid
+          # Pin a tag or digest. :latest lets two replicas run different binaries,
+          # and the id layout is permanent — they must agree on it forever.
+          image: ghcr.io/itmisx/snowid-server:v0.1.0
+          args:
+            # No --worker-id: it comes from the pod ordinal, below.
+            #
+            # Set the epoch once, before the first id is issued, and never change
+            # it: every id ever handed out is decoded relative to it.
+            - --epoch=1577836800000 # 2020-01-01T00:00:00Z
+            # - --datacenter-bits=5
+            # - --worker-bits=5
+            # - --datacenter-id=1
+          env:
+            # THE WHOLE POINT. The StatefulSet controller sets this label to the
+            # pod's ordinal; nothing else does. No hostname parsing, no guessing.
+            - name: SNOWID_WORKER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['apps.kubernetes.io/pod-index']
+            # The datacenter is a property of the cluster, not of the pod, so it
+            # comes from wherever you keep per-cluster config. One value per
+            # cluster; every replica in it shares the same datacenter id.
+            #
+            # - name: SNOWID_DATACENTER_ID
+            #   valueFrom:
+            #     configMapKeyRef:
+            #       name: cluster-info
+            #       key: datacenter-id
+          ports:
+            - name: grpc
+              containerPort: 50051
+          readinessProbe:
+            grpc:
+              port: 50051
+            periodSeconds: 5
+          livenessProbe:
+            grpc:
+              port: 50051
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              cpu: 500m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+            capabilities:
+              drop: ["ALL"]
+            # Required by the "restricted" Pod Security Standard; without it the
+            # pod is rejected at admission in such a namespace.
+            seccompProfile:
+              type: RuntimeDefault

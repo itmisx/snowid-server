@@ -30,3 +30,9 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Release artifacts, built by .github/workflows/release.yml
+dist/
+
+# macOS
+.DS_Store
