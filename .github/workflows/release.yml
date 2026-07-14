@@ -52,6 +52,9 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # The tags this release will ultimately carry — but NOT the ones it is pushed
+      # with. See the two-step publish below.
+      #
       # v1.2.3 -> :v1.2.3, :1.2, :1, :latest
       #
       # :latest exists for `docker run`, and for nothing else. Do not put it in a
@@ -67,15 +70,23 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
-            type=sha,format=long
 
+      # Publish in two steps, and this is the whole point of the ordering:
+      #
+      #   1. push under the commit sha ONLY — a name nobody consumes;
+      #   2. verify it;
+      #   3. only then move :v1.2.3, :1.2, :1 and :latest onto it.
+      #
+      # Pushing the version tags up front, as this used to, means a failed
+      # verification leaves :latest already pointing at an image that was never
+      # shown to start. A tag people pull must never mean "we hope this works".
       - id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          tags: ${{ env.IMAGE }}:sha-${{ github.sha }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             VERSION=${{ github.ref_name }}
@@ -84,21 +95,58 @@ jobs:
           provenance: mode=max
           sbom: true
 
-      # Building an image is not the same as the image working. An entrypoint that
-      # exits, or a USER the runtime rejects, both build perfectly happily — so
-      # pull each architecture back down and actually start it.
-      #
-      # amd64 runs natively; arm64 runs under the QEMU registered above, which is
-      # slow but fine for a three-second smoke test.
-      - name: each architecture starts and serves
+      # What actually went to the registry. imagetools reads the index directly with
+      # buildx's own registry client, so it copes with the unknown/unknown
+      # attestation manifests that provenance and sbom add — which the docker
+      # daemon's image store does not.
+      - name: the published index carries both architectures
+        env:
+          REF: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
         run: |
           set -euo pipefail
+
+          # Human-readable, for the log.
+          docker buildx imagetools inspect "$REF"
+
+          # And the assertion. The OCI index's JSON shape is a spec, not a buildx
+          # implementation detail, so parse that rather than a --format template.
+          docker buildx imagetools inspect "$REF" --format '{{json .Manifest}}' > index.json
+
+          for platform in linux/amd64 linux/arm64; do
+            os=${platform%/*} arch=${platform#*/}
+            jq -e --arg os "$os" --arg arch "$arch" \
+              '.manifests[] | select(.platform.os == $os and .platform.architecture == $arch)' \
+              index.json > /dev/null \
+              || { echo "the published index has no $platform manifest"; exit 1; }
+            echo "ok: $platform"
+          done
+
+      # Building an image is not the same as the image working. An entrypoint that
+      # exits, or a USER the runtime rejects, both build perfectly happily — so pull
+      # each architecture back down and actually start it.
+      #
+      # By TAG, not by digest. `docker run --platform X image@sha256:...` fails with
+      # "cannot overwrite digest" (moby/moby#43188): the digest pins one exact
+      # manifest, --platform asks to resolve a different one out of the index, and
+      # the daemon refuses to reconcile the two. A tag has no such conflict — and it
+      # is also how a user would actually pull this.
+      #
+      # amd64 runs natively; arm64 runs under the QEMU registered above, which is
+      # slow but fine for a five-second smoke test.
+      - name: each architecture starts and serves
+        env:
+          # The sha tag, because the version tags do not exist yet — that is the
+          # point. Nothing carries a name people pull until it has passed this.
+          REF: ${{ env.IMAGE }}:sha-${{ github.sha }}
+        run: |
+          set -euo pipefail
+          echo "smoke-testing $REF"
+
           for platform in linux/amd64 linux/arm64; do
             echo "::group::$platform"
             name="smoke-${platform##*/}"
 
-            docker run -d --name "$name" --platform "$platform" \
-              "${IMAGE}@${{ steps.build.outputs.digest }}" --worker-id 0
+            docker run -d --name "$name" --platform "$platform" "$REF" --worker-id 0
             sleep 5
             docker logs "$name"
 
@@ -106,8 +154,7 @@ jobs:
               | grep -qx "$name" || { echo "$platform: container is not running"; exit 1; }
 
             # And it must still refuse a layout that would silently emit broken ids.
-            if docker run --rm --platform "$platform" \
-                 "${IMAGE}@${{ steps.build.outputs.digest }}" --worker-id 0 --worker-bits 19; then
+            if docker run --rm --platform "$platform" "$REF" --worker-id 0 --worker-bits 19; then
               echo "$platform: started with an overflowed timestamp layout; it should have refused"
               exit 1
             fi
@@ -115,6 +162,26 @@ jobs:
             docker rm -f "$name" >/dev/null
             echo "::endgroup::"
           done
+
+      # Verified. Only NOW do the names people pull get pointed at it.
+      #
+      # imagetools create re-points a tag at an existing digest without rebuilding
+      # or re-uploading anything — the layers are already in the registry. If the
+      # smoke test above had failed, the workflow would have stopped here and the
+      # only thing in the registry would be a sha tag nobody consumes.
+      - name: promote the verified image to its version tags
+        env:
+          SOURCE: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          args=()
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            echo "  -> $tag"
+            args+=(--tag "$tag")
+          done <<< "${{ steps.meta.outputs.tags }}"
+
+          docker buildx imagetools create "${args[@]}" "$SOURCE"
 
       # Links the published image back to the commit and workflow that produced it,
       # so `gh attestation verify` can prove where it came from.
