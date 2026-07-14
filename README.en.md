@@ -85,50 +85,62 @@ Each pod takes its `worker-id` from its own StatefulSet ordinal — **no externa
 
 | Flag | Environment | Default | Meaning |
 | :--- | :--- | :--- | :--- |
-| `--worker-id` | `SNOWID_WORKER_ID` | ⚠️ **required** | This machine's ID within its datacenter |
-| `--datacenter-id` | `SNOWID_DATACENTER_ID` | `0` | This datacenter's ID |
-| `--worker-bits` | | `10` | Worker segment width → up to **1024** per datacenter |
-| `--datacenter-bits` | | `0` | Datacenter segment width. `0` = no datacenters |
-| `--epoch` | | `1577836800000` | Timestamp zero point, **unix ms** (2020-01-01 UTC) |
+| `--worker-id` | `SNOWID_WORKER_ID` | ⚠️ **required** | This machine's ID within its datacenter. The **only** value that differs per pod, hence the env var |
+| `--datacenter-id` | | ⚠️ **required** with `datacenter-bits` | This datacenter's ID. One value per cluster, shared by every replica |
+| `--node-bits` | | `10` | Width of the **whole** node segment (datacenter + worker) |
+| `--datacenter-bits` | | `0` | How much of it is the datacenter. Worker = `node-bits − datacenter-bits` |
+| `--step-bits` | | `12` | Step segment width → **4096** IDs/ms/worker |
+| `--epoch` | | `1727712000000` | Timestamp zero point, **unix ms** (2024-10-01 UTC+8) |
 | `--addr` | | `:50051` | gRPC listen address |
 
 > [!WARNING]
-> **`--worker-bits`, `--datacenter-bits` and `--epoch` are permanent.**
+> **`--node-bits`, `--datacenter-bits`, `--step-bits` and `--epoch` are permanent.**
 > Every ID you have ever issued is decoded relative to them.
 > **Choose them before the first ID, and never change them.**
 
 <details>
-<summary><b>🧮 The bit budget — add datacenter bits, take them off the worker</b></summary>
+<summary><b>🧮 The bit budget — one rule: node + step ≤ 22</b></summary>
 
 <br>
 
-There are 64 bits and no more. The top one stays 0, so 63 are yours to divide, and the step
-segment takes a fixed 12. The datacenter, the worker and **the timestamp all compete for the
-same remainder**:
+There are 64 bits and no more. The top one stays 0; the timestamp, the node and the step share
+the other 63:
 
 ```
-timestamp_bits = 63 - datacenter_bits - worker_bits - 12
+node segment = datacenter + worker      (the worker is DERIVED, never configured)
+timestamp bits = 63 − node-bits − step-bits
 ```
 
-**The two width flags ADD** — the datacenter is not carved out of the worker. So adding
-`--datacenter-bits` without taking the same off `--worker-bits` steals the bits from the
-*timestamp*, and the layout's lifespan falls off a cliff:
+**The rule, entire:**
 
-| `--datacenter-bits` | `--worker-bits` | Identities | Timestamp bits | Lasts |
-| :---: | :---: | :---: | :---: | :--- |
-| `0` *(default)* | `10` | 1024 | 41 | ✅ **69.7 years** |
-| `5` | `5` | 32 × 32 = 1024 | 41 | ✅ **69.7 years** *(Twitter's)* |
-| `3` | `7` | 8 × 128 = 1024 | 41 | ✅ **69.7 years** |
-| `5` | **`10`** ⚠️ forgot | 32 × 1024 = 32768 | 36 | ❌ **2.2 years** — expired in 2022 |
+```
+--node-bits + --step-bits ≤ 22
+```
 
-That last row is **refused at startup**. You do not get to run a layout that expired two years
-after its own epoch:
+That is bwmarrin's own documented constraint. Stay inside it and the timestamp always keeps **at
+least 41 bits — about 69 years**. The layout cannot quietly expire, so nothing else needs checking.
+
+| `--node-bits` | `--step-bits` | Total | Identities | IDs/ms/worker | |
+| :---: | :---: | :---: | ---: | ---: | :--- |
+| `10` *(default)* | `12` | 22 | 1,024 | 4,096 | ✅ Twitter's |
+| `12` | `10` | 22 | 4,096 | 1,024 | ✅ more workers, less throughput each |
+| `5` | `17` | 22 | 32 | 131,072 | ✅ fewer workers, more throughput each |
+| `11` | `12` | **23** | — | — | ❌ over |
+
+Go over and it **refuses to start**:
 
 ```console
-$ snowid-server --datacenter-bits 5 --worker-id 2 --datacenter-id 1
-ERROR startup failed error="--epoch=1577836800000 is too far in the past:
-      36 bits of timestamp hold only 19088h44m36.736s, and 57277h6m24.432s have passed since it"
+$ snowid-server --worker-id 0 --node-bits 11
+ERROR startup failed error="--node-bits(11) + --step-bits(12) = 23, and snowflake has only
+      22 bits for the two of them; everything else is the timestamp"
 ```
+
+> [!NOTE]
+> **bwmarrin will not stop you.** Its own comment says *"you have a total 22 bits to share between
+> Node/Step"* — and **nothing in the library enforces it**. `NewNode()` validates the node ID's
+> range and nothing else. Go wider and `Generate()` shifts the timestamp **clean out of its
+> segment**, silently emitting IDs whose time is wrong, whose sign bit is set (negative), and which
+> repeat once the segment wraps. This guard has to live here.
 
 </details>
 
@@ -137,22 +149,24 @@ ERROR startup failed error="--epoch=1577836800000 is too far in the past:
 
 <br>
 
-Off by default. Turn them on and you get Twitter's original 5/5 split (note that
-`--worker-bits` comes **down** from 10 to 5):
+Off by default (`--datacenter-bits=0`, so the worker gets the whole 10-bit node segment). Turn
+them on and the datacenter takes a **slice off the top** — the worker gets the rest, and is
+**never configured**:
 
 ```console
-$ snowid-server --datacenter-bits 5 --worker-bits 5 --datacenter-id 1 --worker-id 2
-INFO generator ready worker_id=2 worker_bits=5 max_workers=32 \
-     datacenter_id=1 datacenter_bits=5 max_datacenters=32 ...
+$ snowid-server --datacenter-bits 5 --datacenter-id 1 --worker-id 2
+INFO generator ready worker_id=2 node_bits=10 step_bits=12 max_workers=32 \
+     datacenter_id=1 datacenter_bits=5 max_datacenters=32 node_id=34
 ```
 
-**32 datacenters × 32 workers each = 1024 identities** — the same total as the default, with the
-timestamp still on 41 bits. You have **re-divided** those 10 identity bits, not asked for more.
+`node-bits=10`, 5 of them to the datacenter, so 5 are left for the worker →
+**32 datacenters × 32 workers = 1024 identities**. The same total as the default, with the
+timestamp still on 41 bits: you have **re-divided** those 10 bits, not asked for more.
 
 Underneath, the two are **concatenated**:
 
 ```go
-identity = (datacenter_id << worker_bits) | worker_id
+node_id = (datacenter_id << worker_bits) | worker_id      // worker_bits = node-bits - datacenter-bits
 ```
 
 > [!CAUTION]
@@ -166,36 +180,10 @@ Either ID overflowing its segment would spill into the other's bits and land on 
 identity, so the server refuses:
 
 ```console
-$ snowid-server --datacenter-bits 5 --worker-bits 5 --datacenter-id 1 --worker-id 32
-ERROR startup failed error="--worker-id=32 is out of range [0,31] for --worker-bits=5"
+$ snowid-server --datacenter-bits 5 --datacenter-id 1 --worker-id 32
+ERROR startup failed error="--worker-id=32 is out of range [0,31]: --node-bits(10) less
+      --datacenter-bits(5) leaves 5 bits for the worker"
 ```
-
-</details>
-
-<details>
-<summary><b>🛡️ Why startup validation exists</b></summary>
-
-<br>
-
-bwmarrin's `Generate()` **returns no error and does no bounds check** — it shifts the timestamp
-into place and hands you the result. A bad layout therefore **does not fail**. It **silently**
-emits:
-
-- IDs whose time is wrong
-- IDs whose sign bit is set — **negative IDs**
-- IDs that **repeat** once the segment wraps
-
-For example: `--worker-bits=19`, plus the fixed 12 step bits, leaves 32 bits of timestamp =
-**49.7 days** — against an epoch in 2020. **That layout overflowed years ago.** So it has to be
-caught at startup, or never:
-
-```console
-$ snowid-server --worker-id 0 --worker-bits 19
-ERROR startup failed error="--epoch=1577836800000 is too far in the past:
-      32 bits of timestamp hold only 1193h2m47.296s, and 57276h16m11.412s have passed since it"
-```
-
-The `ids_valid_until` line in the startup log says how long the layout you chose lasts.
 
 </details>
 
@@ -354,23 +342,28 @@ and a test caught it. The `pod-index` label is exact, unambiguous, and fails clo
 <br>
 
 The **datacenter ID is a property of the cluster, not the pod** — every replica in a cluster
-shares it. So it comes from wherever you keep per-cluster config, a ConfigMap say:
+shares it. So it goes in the args, next to the layout it belongs to. Only `worker-id`, which
+differs per pod, needs the environment:
 
 ```yaml
+# the cluster in datacenter A
 args:
-  - --datacenter-bits=5
-  - --worker-bits=5
+  - --datacenter-bits=5      # 5 of node-bits(10) go to the datacenter; the worker gets 5
+  - --datacenter-id=0        # required. Datacenter B's cluster says =1; the rest is identical
 env:
-  - name: SNOWID_WORKER_ID
+  - name: SNOWID_WORKER_ID   # differs per pod → only the downward API can supply it
     valueFrom:
       fieldRef:
         fieldPath: metadata.labels['apps.kubernetes.io/pod-index']
-  - name: SNOWID_DATACENTER_ID
-    valueFrom:
-      configMapKeyRef:
-        name: cluster-info
-        key: datacenter-id
 ```
+
+> [!IMPORTANT]
+> **`--datacenter-id` is required whenever `--datacenter-bits` is set. There is no default.**
+>
+> Because a default of `0` is a default *identity*. And the way you really get duplicate IDs
+> is by copying a working manifest to a second cluster and changing nothing — so the second
+> cluster has to say `--datacenter-id=1` out loud, or the server refuses to start. Same
+> reasoning as `--worker-id`.
 
 </details>
 

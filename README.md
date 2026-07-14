@@ -84,46 +84,59 @@ kubectl apply -f https://raw.githubusercontent.com/itmisx/snowid-server/main/dep
 
 | 参数 | 环境变量 | 默认 | 说明 |
 | :--- | :--- | :--- | :--- |
-| `--worker-id` | `SNOWID_WORKER_ID` | ⚠️ **必填** | 本机器在其机房内的 ID |
-| `--datacenter-id` | `SNOWID_DATACENTER_ID` | `0` | 本机房的 ID |
-| `--worker-bits` | | `10` | 机器段宽度 → 每机房最多 **1024** 台 |
-| `--datacenter-bits` | | `0` | 机房段宽度，`0` = 不分机房 |
-| `--epoch` | | `1577836800000` | 时间戳零点，**Unix 毫秒**（2020-01-01 UTC） |
+| `--worker-id` | `SNOWID_WORKER_ID` | ⚠️ **必填** | 本机器在其机房内的 ID。**唯一一个逐 pod 不同的值**，所以支持环境变量 |
+| `--datacenter-id` | | ⚠️ 设了 `datacenter-bits` 就**必填** | 本机房的 ID。整个集群一个值，所有副本共用 |
+| `--node-bits` | | `10` | **整个** node 段宽度（机房 + 机器） |
+| `--datacenter-bits` | | `0` | node 段里有几位是机房。机器段 = `node-bits − datacenter-bits` |
+| `--step-bits` | | `12` | 序号段宽度 → 每机器每毫秒 **4096** 个 ID |
+| `--epoch` | | `1727712000000` | 时间戳零点，**Unix 毫秒**（2024-10-01 UTC+8） |
 | `--addr` | | `:50051` | gRPC 监听地址 |
 
 > [!WARNING]
-> **`--worker-bits`、`--datacenter-bits`、`--epoch` 是永久性的。**
+> **`--node-bits`、`--datacenter-bits`、`--step-bits`、`--epoch` 是永久性的。**
 > 每一个已发出的 ID 都是相对它们解码的。**发出第一个 ID 之前定好，之后绝不要改。**
 
 <details>
-<summary><b>🧮 位数预算 —— 加机房位，就得减机器位</b></summary>
+<summary><b>🧮 位数预算 —— 唯一的规则：node + step ≤ 22</b></summary>
 
 <br>
 
-64 位是固定的，最高位恒为 0，所以只有 63 位可分。序号段固定 12 位，剩下的**机房段、机器段和
-时间戳段在抢同一块地**：
+64 位是固定的。最高位恒为 0，时间戳、node、序号分剩下的 63 位：
 
 ```
-时间戳位数 = 63 - 机房位数 - 机器位数 - 12
+node 段 = 机房段 + 机器段          （机器段是【减】出来的，不用配）
+时间戳位 = 63 − node-bits − step-bits
 ```
 
-**两个位宽参数是相加的**，不是「机房从机器里切一块」。所以只加 `--datacenter-bits` 而不减
-`--worker-bits`，是在从**时间戳**里偷位——可用年限会断崖式下跌：
+**规则只有一条：**
 
-| `--datacenter-bits` | `--worker-bits` | 身份总数 | 时间戳位 | 能用多久 |
-| :---: | :---: | :---: | :---: | :--- |
-| `0` *(默认)* | `10` | 1024 | 41 | ✅ **69.7 年** |
-| `5` | `5` | 32 × 32 = 1024 | 41 | ✅ **69.7 年** *(Twitter 原版)* |
-| `3` | `7` | 8 × 128 = 1024 | 41 | ✅ **69.7 年** |
-| `5` | **`10`** ⚠️ 忘了减 | 32 × 1024 = 32768 | 36 | ❌ **2.2 年**，从 2020 年算早就溢出 |
+```
+--node-bits + --step-bits ≤ 22
+```
 
-最后那行**启动就会被拒绝**，不会让你带着一个两年就崩的布局跑起来：
+这是 bwmarrin 自己文档里写的约束。守住它，时间戳就**至少留 41 位 ≈ 69 年**——布局不可能悄悄
+到期，所以也不需要别的检查。
+
+| `--node-bits` | `--step-bits` | 合计 | 身份数 | ID/毫秒/机器 | |
+| :---: | :---: | :---: | ---: | ---: | :--- |
+| `10` *(默认)* | `12` | 22 | 1,024 | 4,096 | ✅ Twitter 原版 |
+| `12` | `10` | 22 | 4,096 | 1,024 | ✅ 更多机器，更低单机吞吐 |
+| `5` | `17` | 22 | 32 | 131,072 | ✅ 更少机器，更高单机吞吐 |
+| `11` | `12` | **23** | — | — | ❌ 超了 |
+
+超了就**拒绝启动**：
 
 ```console
-$ snowid-server --datacenter-bits 5 --worker-id 2 --datacenter-id 1
-ERROR startup failed error="--epoch=1577836800000 is too far in the past:
-      36 bits of timestamp hold only 19088h44m36.736s, and 57277h6m24.432s have passed since it"
+$ snowid-server --worker-id 0 --node-bits 11
+ERROR startup failed error="--node-bits(11) + --step-bits(12) = 23, and snowflake has only
+      22 bits for the two of them; everything else is the timestamp"
 ```
+
+> [!NOTE]
+> **bwmarrin 不会拦你。** 它的注释白纸黑字写着「你总共只有 22 位给 Node/Step 分」，但**代码里
+> 没有任何检查**——`NewNode()` 只校验 node ID 的范围。位宽设过头，`Generate()` 会把时间戳直接
+> **移出段外**，一声不吭地发出时间戳错误、符号位被污染（负数）、并且回绕后重复的 ID。
+> 这道守卫必须由我们来做。
 
 </details>
 
@@ -132,21 +145,22 @@ ERROR startup failed error="--epoch=1577836800000 is too far in the past:
 
 <br>
 
-默认不分机房。要分的话，就是 Twitter 原版的 5/5 分法（**注意 `--worker-bits` 要从 10 减到 5**）：
+默认不分机房（`--datacenter-bits=0`，node 段整整 10 位全归机器）。要分的话，就从 node 段里
+**切一块**给机房——**机器段是减出来的，不用配**：
 
 ```console
-$ snowid-server --datacenter-bits 5 --worker-bits 5 --datacenter-id 1 --worker-id 2
-INFO generator ready worker_id=2 worker_bits=5 max_workers=32 \
-     datacenter_id=1 datacenter_bits=5 max_datacenters=32 ...
+$ snowid-server --datacenter-bits 5 --datacenter-id 1 --worker-id 2
+INFO generator ready worker_id=2 node_bits=10 step_bits=12 max_workers=32 \
+     datacenter_id=1 datacenter_bits=5 max_datacenters=32 node_id=34
 ```
 
-**32 个机房 × 每机房 32 台 = 1024 个身份**——总数和默认一样，时间戳也还是 41 位。你是把那 10
-位身份**重新划分**了，不是凭空多要位。
+`node-bits=10`，切 5 位给机房 → 机器剩 5 位 → **32 个机房 × 每机房 32 台 = 1024 个身份**。
+总数和默认一样，时间戳也还是 41 位——你只是把那 10 位**重新划分**了，没有多要一位。
 
 底层是**位拼接**：
 
 ```go
-identity = (datacenter_id << 机器位数) | worker_id
+node_id = (datacenter_id << 机器位数) | worker_id      // 机器位数 = node-bits - datacenter-bits
 ```
 
 > [!CAUTION]
@@ -158,34 +172,10 @@ identity = (datacenter_id << 机器位数) | worker_id
 任何一个 ID 溢出自己那几位，就会**侵占对方的位**、落到别人的身份上。所以服务会拒绝：
 
 ```console
-$ snowid-server --datacenter-bits 5 --worker-bits 5 --datacenter-id 1 --worker-id 32
-ERROR startup failed error="--worker-id=32 is out of range [0,31] for --worker-bits=5"
+$ snowid-server --datacenter-bits 5 --datacenter-id 1 --worker-id 32
+ERROR startup failed error="--worker-id=32 is out of range [0,31]: --node-bits(10) less
+      --datacenter-bits(5) leaves 5 bits for the worker"
 ```
-
-</details>
-
-<details>
-<summary><b>🛡️ 为什么要做启动校验</b></summary>
-
-<br>
-
-bwmarrin 的 `Generate()` **没有 error 返回，也不做边界检查**——它直接把时间戳移位塞进去。所以
-位宽配错了它**不会报错**，而是**静默地**发出：
-
-- 时间戳错误的 ID
-- 符号位被污染的 ID（**负数**）
-- 段位回绕后**重复**的 ID
-
-举例：`--worker-bits=19` 加上固定的 12 位序号，只剩 32 位时间戳 = **49.7 天**，而默认 epoch 是
-2020 年——**这个配置早就溢出了**。只能在启动时拦下：
-
-```console
-$ snowid-server --worker-id 0 --worker-bits 19
-ERROR startup failed error="--epoch=1577836800000 is too far in the past:
-      32 bits of timestamp hold only 1193h2m47.296s, and 57276h16m11.412s have passed since it"
-```
-
-启动日志里的 `ids_valid_until` 会告诉你这套布局能用到哪一天。
 
 </details>
 
@@ -336,24 +326,27 @@ PodOrdinal("snowid-7d4b9c5f8-84272") = 84272   ← 被当成序号了！
 
 <br>
 
-**机房 ID 是集群的属性，不是 pod 的属性**——同一集群内所有副本共用一个值。所以它从集群自己的
-配置里来，例如 ConfigMap：
+**机房 ID 是集群的属性，不是 pod 的属性**——同一集群内所有副本共用一个值。所以它和位宽一样，
+就写在启动参数里；只有逐 pod 不同的 `worker-id` 才需要走环境变量：
 
 ```yaml
+# 机房 A 的集群
 args:
-  - --datacenter-bits=5
-  - --worker-bits=5
+  - --datacenter-bits=5      # node-bits(10) 里切 5 位给机房，机器段自动剩 5 位
+  - --datacenter-id=0        # 必填。机房 B 的集群改成 =1，其余一模一样
 env:
-  - name: SNOWID_WORKER_ID
+  - name: SNOWID_WORKER_ID   # 逐 pod 不同 → 只能从 downward API 来
     valueFrom:
       fieldRef:
         fieldPath: metadata.labels['apps.kubernetes.io/pod-index']
-  - name: SNOWID_DATACENTER_ID
-    valueFrom:
-      configMapKeyRef:
-        name: cluster-info
-        key: datacenter-id
 ```
+
+> [!IMPORTANT]
+> **只要设了 `--datacenter-bits`，`--datacenter-id` 就是必填的——没有默认值。**
+>
+> 因为**默认值 `0` 就是一个默认身份**。而重复 ID 最真实的来法，就是把一份跑得好好的 yaml
+> 复制到第二个集群、什么都不改。所以第二个集群必须把 `--datacenter-id=1` **说出口**，否则
+> 服务直接拒绝启动。这和 `--worker-id` 必填是同一个道理。
 
 </details>
 

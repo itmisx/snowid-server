@@ -19,9 +19,9 @@
 # Requires Kubernetes 1.28+ for the pod-index label (beta and on by default there,
 # GA in 1.32). On older clusters, set --worker-id yourself — one StatefulSet per id.
 #
-# With the default 10 worker bits you can run up to 1024 replicas. One replica
-# already serves 4,096,000 ids/second, so replicas are about resilience, not
-# throughput.
+# The 10 node bits below are split 5/5, so this manifest allows 32 datacenters of
+# 32 replicas each. One replica already serves 4,096,000 ids/second, so replicas
+# are about resilience, not throughput — 32 is not a ceiling you will feel.
 apiVersion: v1
 kind: Service
 metadata:
@@ -62,32 +62,48 @@ spec:
         - name: snowid
           # Pin a tag or digest. :latest lets two replicas run different binaries,
           # and the id layout is permanent — they must agree on it forever.
-          image: ghcr.io/itmisx/snowid-server:v0.1.0
+          image: ghcr.io/itmisx/snowid-server:v0.0.5
           args:
-            # No --worker-id: it comes from the pod ordinal, below.
+            # THE LAYOUT. Every one of these is PERMANENT: each id you have ever
+            # issued is decoded relative to them, so changing one afterwards makes
+            # every existing id decode to the wrong time and the wrong origin.
+            # Settle them before the first id, and never touch them again.
             #
-            # Set the epoch once, before the first id is issued, and never change
-            # it: every id ever handed out is decoded relative to it.
-            - --epoch=1577836800000 # 2020-01-01T00:00:00Z
-            # - --datacenter-bits=5
-            # - --worker-bits=5
-            # - --datacenter-id=1
+            #   | unused(1) | timestamp(41) | datacenter(5) | worker(5) | step(12) |
+            #                                 \_____ node segment (10) _____/
+            #
+            # node-bits + step-bits may not exceed 22 — that is snowflake's whole
+            # budget for the two, and the timestamp gets the rest (41 bits here,
+            # about 69 years). The server refuses to start if you go over.
+            - --epoch=1727712000000 # 2024-10-01T00:00:00+08:00
+            - --node-bits=10 # the whole node segment: 1024 identities
+            - --step-bits=12 # 4096 ids per millisecond per worker
+            # The datacenter takes the top 5 of the node segment's 10 bits, so the
+            # worker is left 5: 32 datacenters of 32 replicas. Worker width is
+            # derived, never configured, so a split cannot fail to add up — and 5
+            # worker bits do cap this StatefulSet at 32 replicas, since pod 32 would
+            # not fit its segment and the server refuses to start rather than wrap
+            # onto pod 0's identity.
+            - --datacenter-bits=5
+            #
+            # Which datacenter THIS cluster is. One value for the whole StatefulSet —
+            # every replica shares the datacenter and differs only in worker id — so
+            # it is a plain flag, not an env var.
+            #
+            # REQUIRED, because --datacenter-bits is set: the server will not start
+            # without it. There is no default, on purpose. A default of 0 is a default
+            # IDENTITY, and the way you get duplicate ids is by copying this file to a
+            # second cluster and changing nothing — so the second cluster has to say
+            # --datacenter-id=1 out loud.
+            - --datacenter-id=0
           env:
-            # THE WHOLE POINT. The StatefulSet controller sets this label to the
-            # pod's ordinal; nothing else does. No hostname parsing, no guessing.
+            # THE WHOLE POINT, and the one value a flag cannot carry: it differs per
+            # pod. The StatefulSet controller sets this label to the pod's ordinal;
+            # nothing else does. No hostname parsing, no guessing.
             - name: SNOWID_WORKER_ID
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.labels['apps.kubernetes.io/pod-index']
-            # The datacenter is a property of the cluster, not of the pod, so it
-            # comes from wherever you keep per-cluster config. One value per
-            # cluster; every replica in it shares the same datacenter id.
-            #
-            # - name: SNOWID_DATACENTER_ID
-            #   valueFrom:
-            #     configMapKeyRef:
-            #       name: cluster-info
-            #       key: datacenter-id
           ports:
             - name: grpc
               containerPort: 50051

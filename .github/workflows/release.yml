@@ -105,7 +105,7 @@ jobs:
           docker ps --filter name=smoke --filter status=running --format '{{.Names}}' \
             | grep -qx smoke || { echo "the container is not running"; exit 1; }
 
-          if docker run --rm "$REF" --worker-id 0 --worker-bits 19; then
+          if docker run --rm "$REF" --worker-id 0 --node-bits 11; then   # 11 + 12 = 23 > 22
             echo "started with an overflowed timestamp layout; it should have refused"
             exit 1
           fi

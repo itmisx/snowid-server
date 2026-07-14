@@ -5,21 +5,202 @@ import (
 	"os"
 	"testing"
 	"time"
-
-	"github.com/itmisx/snowid-server/pkg/snowflake"
 )
 
 var (
-	testNow   = time.Date(2026, 7, 14, 0, 0, 0, 0, time.UTC)
-	testEpoch = time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	testNow   = time.Date(2026, 7, 15, 0, 0, 0, 0, time.UTC)
+	testEpoch = time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC).UnixMilli()
 )
 
-func layout(datacenterBits, workerBits uint8) snowflake.Layout {
-	return snowflake.Layout{
-		EpochMilli:     testEpoch.UnixMilli(),
-		DatacenterBits: datacenterBits,
-		WorkerBits:     workerBits,
-		StepBits:       stepBits,
+// cfg is a valid default that each test bends in exactly one direction. It has no
+// datacenters, so -1 ("not given") is the right datacenter id: there are no bits to
+// put one in.
+func cfg() config {
+	return config{
+		addr:           ":50051",
+		workerID:       0,
+		datacenterID:   -1,
+		nodeBits:       10,
+		datacenterBits: 0,
+		stepBits:       12,
+		epochMilli:     testEpoch,
+	}
+}
+
+func TestValidateAcceptsTheDefaults(t *testing.T) {
+	if err := cfg().validate(testNow); err != nil {
+		t.Fatalf("the default layout must be valid: %v", err)
+	}
+}
+
+// Twitter's original: the 10-bit node segment split 5/5.
+func TestValidateAcceptsTwitterSplit(t *testing.T) {
+	c := cfg()
+	c.datacenterBits, c.datacenterID, c.workerID = 5, 31, 31
+
+	if err := c.validate(testNow); err != nil {
+		t.Fatalf("the last valid pair (31,31) of a 5/5 split was rejected: %v", err)
+	}
+	if got := c.workerBits(); got != 5 {
+		t.Fatalf("worker bits = %d, want 5 — node-bits(10) less datacenter-bits(5)", got)
+	}
+}
+
+// The whole rule, and the only one that needs stating: bwmarrin's own doc says
+// "you have a total 22 bits to share between Node/Step" — and nothing in the
+// library enforces it. Generate() shifts the timestamp clean out of its segment
+// without a word, so this is the guard.
+func TestNodeAndStepBitsCannotExceed22(t *testing.T) {
+	for _, tc := range []struct {
+		nodeBits, stepBits uint8
+		wantAccepted       bool
+	}{
+		{10, 12, true},  // the default, and Twitter's: exactly 22
+		{5, 17, true},   // 22
+		{12, 10, true},  // 22
+		{9, 12, true},   // 21, under the limit
+		{11, 12, false}, // 23
+		{12, 12, false}, // 24
+		{20, 12, false}, // 32
+	} {
+		t.Run(fmt.Sprintf("node=%d/step=%d", tc.nodeBits, tc.stepBits), func(t *testing.T) {
+			c := cfg()
+			c.nodeBits, c.stepBits = tc.nodeBits, tc.stepBits
+
+			err := c.validate(testNow)
+			if accepted := err == nil; accepted != tc.wantAccepted {
+				if tc.wantAccepted {
+					t.Fatalf("rejected node(%d)+step(%d)=%d, which is within 22: %v",
+						tc.nodeBits, tc.stepBits, tc.nodeBits+tc.stepBits, err)
+				}
+				t.Fatalf("accepted node(%d)+step(%d)=%d, over the 22 bits snowflake has for them; "+
+					"the timestamp would be shifted out of its segment",
+					tc.nodeBits, tc.stepBits, tc.nodeBits+tc.stepBits)
+			}
+		})
+	}
+}
+
+// And the reason that one rule is enough: inside 22, the timestamp always keeps at
+// least 41 bits, which is about 69 years. The layout cannot quietly expire, so
+// nothing else has to check that it will not.
+func TestStayingInside22LeavesAtLeast41TimestampBits(t *testing.T) {
+	for nodeBits := uint8(0); nodeBits <= maxNodeAndStepBits; nodeBits++ {
+		for stepBits := uint8(0); int(nodeBits)+int(stepBits) <= maxNodeAndStepBits; stepBits++ {
+			c := cfg()
+			c.nodeBits, c.stepBits = nodeBits, stepBits
+			c.workerID, c.datacenterID = 0, 0
+
+			if got := c.layout().TimestampBits(); got < 41 {
+				t.Fatalf("node=%d step=%d leaves only %d timestamp bits", nodeBits, stepBits, got)
+			}
+		}
+	}
+}
+
+// The datacenter is the top of the node segment; the worker is what is left. It
+// cannot take more than there is.
+func TestDatacenterBitsCannotExceedNodeBits(t *testing.T) {
+	c := cfg()
+	c.nodeBits, c.datacenterBits = 10, 11
+
+	if err := c.validate(testNow); err == nil {
+		t.Fatal("--datacenter-bits=11 does not fit inside --node-bits=10, want an error")
+	}
+}
+
+// Either id overflowing its share of the node segment would spill into the other's
+// bits and land on an identity that belongs to somebody else.
+func TestIDsMustFitTheirShareOfTheNodeSegment(t *testing.T) {
+	// 10 node bits split 5/5: 32 datacenters of 32 workers.
+	split := func(dcID, workerID int64) config {
+		c := cfg()
+		c.datacenterBits, c.datacenterID, c.workerID = 5, dcID, workerID
+		return c
+	}
+
+	if err := split(31, 31).validate(testNow); err != nil {
+		t.Errorf("(31,31) is the last valid pair of a 5/5 split: %v", err)
+	}
+	if err := split(32, 0).validate(testNow); err == nil {
+		t.Error("--datacenter-id=32 does not fit in 5 bits, want an error")
+	}
+	if err := split(0, 32).validate(testNow); err == nil {
+		t.Error("--worker-id=32 does not fit in the 5 bits left over, want an error")
+	}
+}
+
+// The datacenter id gets the same treatment as the worker id, and for the same
+// reason: a default of 0 is a default IDENTITY. Two clusters that both take it are
+// two processes with one identity, and they issue the same ids — which is exactly
+// what happens when somebody copies a working manifest to a second cluster and
+// changes nothing. So it must be spelled out whenever there are bits to hold it.
+func TestDatacenterIDIsRequiredWhenThereAreDatacenterBits(t *testing.T) {
+	c := cfg()
+	c.datacenterBits, c.datacenterID = 5, -1 // -1 is what the flag defaults to
+
+	if err := c.validate(testNow); err == nil {
+		t.Fatal("--datacenter-bits=5 with no --datacenter-id was accepted; a second cluster " +
+			"copying this manifest would silently issue duplicate ids")
+	}
+
+	c.datacenterID = 0 // spelled out, so the author meant it
+	if err := c.validate(testNow); err != nil {
+		t.Fatalf("an explicit --datacenter-id=0 must be accepted: %v", err)
+	}
+}
+
+// And it is meaningless without them: it would have nowhere to go.
+func TestDatacenterIDIsRefusedWithoutDatacenterBits(t *testing.T) {
+	c := cfg() // datacenterBits: 0
+	c.datacenterID = 3
+
+	if err := c.validate(testNow); err == nil {
+		t.Fatal("--datacenter-id=3 with --datacenter-bits=0 was accepted; the id has nowhere " +
+			"to go, so the config does not mean what its author thinks")
+	}
+}
+
+// Without datacenter bits, "not given" resolves to the one datacenter there is.
+func TestDatacenterResolvesToZeroWhenThereAreNoDatacenters(t *testing.T) {
+	c := cfg()
+	if err := c.validate(testNow); err != nil {
+		t.Fatalf("no datacenters and no --datacenter-id is the ordinary case: %v", err)
+	}
+	if got := c.datacenter(); got != 0 {
+		t.Fatalf("datacenter() = %d, want 0 — never the -1 sentinel, which would pack a "+
+			"negative into the node segment", got)
+	}
+}
+
+// Without datacenters the worker gets the whole node segment.
+func TestWorkerIDBoundaryWithoutDatacenters(t *testing.T) {
+	c := cfg()
+	if got := c.workerBits(); got != 10 {
+		t.Fatalf("worker bits = %d, want the whole 10-bit node segment", got)
+	}
+
+	c.workerID = 1023
+	if err := c.validate(testNow); err != nil {
+		t.Errorf("worker id 1023 must fit in 10 bits: %v", err)
+	}
+	c.workerID = 1024
+	if err := c.validate(testNow); err == nil {
+		t.Error("worker id 1024 does not fit in 10 bits, want an error")
+	}
+}
+
+func TestValidateRejectsABadEpoch(t *testing.T) {
+	c := cfg()
+	c.epochMilli = testNow.Add(time.Hour).UnixMilli()
+	if err := c.validate(testNow); err == nil {
+		t.Error("an epoch in the future was accepted")
+	}
+
+	// 41 timestamp bits span ~69 years, so an epoch from 1900 does not fit.
+	c.epochMilli = time.Date(1900, 1, 1, 0, 0, 0, 0, time.UTC).UnixMilli()
+	if err := c.validate(testNow); err == nil {
+		t.Error("an epoch 126 years ago was accepted; 41 bits hold only ~69 years")
 	}
 }
 
@@ -68,116 +249,10 @@ func TestWorkerIDFromTheEnvironment(t *testing.T) {
 // -1 — what an empty variable resolves to — must be refused, which is what makes
 // running this as a Deployment fail closed rather than collide.
 func TestDeploymentFailsClosed(t *testing.T) {
-	if err := validate(0, -1, layout(0, 10), testNow); err == nil {
+	c := cfg()
+	c.workerID = -1
+
+	if err := c.validate(testNow); err == nil {
 		t.Fatal("a missing worker id was accepted; a Deployment would start and collide")
-	}
-}
-
-func TestValidateAcceptsTheDefaults(t *testing.T) {
-	if err := validate(0, 0, layout(snowflake.DefaultDatacenterBits, snowflake.DefaultWorkerBits), testNow); err != nil {
-		t.Fatalf("the default layout must be valid: %v", err)
-	}
-}
-
-// Twitter's original split: 32 datacenters of 32 workers.
-func TestValidateAcceptsTwitterSplit(t *testing.T) {
-	if err := validate(31, 31, layout(5, 5), testNow); err != nil {
-		t.Fatalf("the last valid pair (31,31) of a 5/5 split was rejected: %v", err)
-	}
-}
-
-// Either id overflowing its segment would spill into the other's bits and land on
-// an identity that belongs to somebody else.
-func TestValidateRejectsIDsThatOverflowTheirSegment(t *testing.T) {
-	l := layout(5, 5) // 32 datacenters of 32 workers
-
-	if err := validate(32, 0, l, testNow); err == nil {
-		t.Error("--datacenter-id=32 does not fit in 5 bits, want an error")
-	}
-	if err := validate(0, 32, l, testNow); err == nil {
-		t.Error("--worker-id=32 does not fit in 5 bits, want an error")
-	}
-	if err := validate(-1, 0, l, testNow); err == nil {
-		t.Error("a negative datacenter id was accepted")
-	}
-}
-
-// The one that earns validate its place. bwmarrin's Generate() shifts the
-// timestamp into position with no bounds check, so a layout with too few timestamp
-// bits does not fail — it silently emits ids whose time is wrong, whose sign bit
-// is set, and which repeat once the segment wraps. Nothing downstream would ever
-// notice. So it has to be caught here, at startup, or not at all.
-func TestValidateRejectsALayoutThatWouldSilentlyOverflow(t *testing.T) {
-	// 7 datacenter bits + 12 worker bits + 12 step bits leaves 32 for the
-	// timestamp: 49.7 days of range, against an epoch six years back.
-	err := validate(0, 0, layout(7, 12), testNow)
-	if err == nil {
-		t.Fatal("a layout whose timestamp overflowed six years ago was accepted")
-	}
-	t.Log(err)
-}
-
-func TestValidateRejectsAnEpochInTheFuture(t *testing.T) {
-	l := layout(0, 10)
-	l.EpochMilli = testNow.Add(time.Hour).UnixMilli()
-
-	if err := validate(0, 0, l, testNow); err == nil {
-		t.Fatal("an epoch in the future was accepted")
-	}
-}
-
-// The bit-budget table in the README, made executable.
-//
-// The two width flags ADD — the datacenter is not carved out of the worker — so
-// the bits for it come out of the TIMESTAMP unless you take them off the worker.
-// That is the trap: --datacenter-bits=5 on its own leaves 36 timestamp bits, which
-// ran out in 2022, and every ID after that would be silently wrong. It is exactly
-// the kind of thing a README says and the code stops doing, so pin it here.
-func TestBitBudget(t *testing.T) {
-	for _, tc := range []struct {
-		datacenterBits, workerBits uint8
-		wantIdentities             int64
-		wantTimestampBits          uint8
-		wantAccepted               bool
-	}{
-		{0, 10, 1024, 41, true},   // the default
-		{5, 5, 1024, 41, true},    // Twitter's split: same total, same lifespan
-		{3, 7, 1024, 41, true},    // any split of the same 10 bits
-		{5, 10, 32768, 36, false}, // forgot to take them off the worker
-		{0, snowflake.DefaultWorkerBits, 1024, 41, true},
-	} {
-		name := fmt.Sprintf("dc=%d/worker=%d", tc.datacenterBits, tc.workerBits)
-		t.Run(name, func(t *testing.T) {
-			l := layout(tc.datacenterBits, tc.workerBits)
-
-			if got := int64(1) << tc.datacenterBits * int64(1) << tc.workerBits; got != tc.wantIdentities {
-				t.Errorf("%d identities, README says %d", got, tc.wantIdentities)
-			}
-			if got := l.TimestampBits(); got != tc.wantTimestampBits {
-				t.Errorf("%d timestamp bits, README says %d", got, tc.wantTimestampBits)
-			}
-
-			err := validate(0, 0, l, testNow)
-			if accepted := err == nil; accepted != tc.wantAccepted {
-				if tc.wantAccepted {
-					t.Fatalf("rejected a layout the README says is fine: %v", err)
-				}
-				t.Fatal("accepted a layout whose timestamp overflowed in 2022; every id it " +
-					"issued from then on would be silently wrong")
-			}
-		})
-	}
-}
-
-// The worker segment's whole job is to keep two processes apart, so the boundary
-// of what fits in it has to be exact.
-func TestValidateWorkerIDBoundary(t *testing.T) {
-	l := layout(0, 10) // 1024 workers, 0..1023
-
-	if err := validate(0, 1023, l, testNow); err != nil {
-		t.Errorf("worker id 1023 must fit in 10 bits: %v", err)
-	}
-	if err := validate(0, 1024, l, testNow); err == nil {
-		t.Error("worker id 1024 does not fit in 10 bits, want an error")
 	}
 }
