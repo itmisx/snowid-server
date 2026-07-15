@@ -24,16 +24,19 @@ const _ = grpc.SupportPackageIsVersion7
 type SnowIdClient interface {
 	// Next returns `count` unique IDs, in ascending order.
 	Next(ctx context.Context, in *NextRequest, opts ...grpc.CallOption) (*NextResponse, error)
-	// GetLayout returns the ID layout, so a client can decode IDs itself.
+	// Layout returns the ID layout, so a client can decode IDs itself.
 	//
 	// Decoding is pure bit arithmetic; never call the server to read an ID's
-	// timestamp. Fetch the layout once at startup and decode locally:
+	// timestamp. Fetch the layout once at startup and decode locally. The worker
+	// segment width is derived — the response does not send it — because it is
+	// whatever the node segment has left once the datacenter takes its share:
 	//
-	//	unix_milli = (id >> (datacenter_bits + worker_bits + step_bits)) + epoch_unix_milli
-	//	datacenter = (id >> (worker_bits + step_bits)) & ((1 << datacenter_bits) - 1)
-	//	worker     = (id >> step_bits) & ((1 << worker_bits) - 1)
-	//	step       =  id & ((1 << step_bits) - 1)
-	GetLayout(ctx context.Context, in *GetLayoutRequest, opts ...grpc.CallOption) (*GetLayoutResponse, error)
+	//	worker_bits = node_bits - datacenter_bits
+	//	unix_milli  = (id >> (node_bits + step_bits)) + epoch
+	//	datacenter  = (id >> (worker_bits + step_bits)) & ((1 << datacenter_bits) - 1)
+	//	worker      = (id >> step_bits) & ((1 << worker_bits) - 1)
+	//	step        =  id & ((1 << step_bits) - 1)
+	Layout(ctx context.Context, in *LayoutRequest, opts ...grpc.CallOption) (*LayoutResponse, error)
 }
 
 type snowIdClient struct {
@@ -53,9 +56,9 @@ func (c *snowIdClient) Next(ctx context.Context, in *NextRequest, opts ...grpc.C
 	return out, nil
 }
 
-func (c *snowIdClient) GetLayout(ctx context.Context, in *GetLayoutRequest, opts ...grpc.CallOption) (*GetLayoutResponse, error) {
-	out := new(GetLayoutResponse)
-	err := c.cc.Invoke(ctx, "/snowid.v1.SnowId/GetLayout", in, out, opts...)
+func (c *snowIdClient) Layout(ctx context.Context, in *LayoutRequest, opts ...grpc.CallOption) (*LayoutResponse, error) {
+	out := new(LayoutResponse)
+	err := c.cc.Invoke(ctx, "/snowid.v1.SnowId/Layout", in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -68,16 +71,19 @@ func (c *snowIdClient) GetLayout(ctx context.Context, in *GetLayoutRequest, opts
 type SnowIdServer interface {
 	// Next returns `count` unique IDs, in ascending order.
 	Next(context.Context, *NextRequest) (*NextResponse, error)
-	// GetLayout returns the ID layout, so a client can decode IDs itself.
+	// Layout returns the ID layout, so a client can decode IDs itself.
 	//
 	// Decoding is pure bit arithmetic; never call the server to read an ID's
-	// timestamp. Fetch the layout once at startup and decode locally:
+	// timestamp. Fetch the layout once at startup and decode locally. The worker
+	// segment width is derived — the response does not send it — because it is
+	// whatever the node segment has left once the datacenter takes its share:
 	//
-	//	unix_milli = (id >> (datacenter_bits + worker_bits + step_bits)) + epoch_unix_milli
-	//	datacenter = (id >> (worker_bits + step_bits)) & ((1 << datacenter_bits) - 1)
-	//	worker     = (id >> step_bits) & ((1 << worker_bits) - 1)
-	//	step       =  id & ((1 << step_bits) - 1)
-	GetLayout(context.Context, *GetLayoutRequest) (*GetLayoutResponse, error)
+	//	worker_bits = node_bits - datacenter_bits
+	//	unix_milli  = (id >> (node_bits + step_bits)) + epoch
+	//	datacenter  = (id >> (worker_bits + step_bits)) & ((1 << datacenter_bits) - 1)
+	//	worker      = (id >> step_bits) & ((1 << worker_bits) - 1)
+	//	step        =  id & ((1 << step_bits) - 1)
+	Layout(context.Context, *LayoutRequest) (*LayoutResponse, error)
 	mustEmbedUnimplementedSnowIdServer()
 }
 
@@ -88,8 +94,8 @@ type UnimplementedSnowIdServer struct {
 func (UnimplementedSnowIdServer) Next(context.Context, *NextRequest) (*NextResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Next not implemented")
 }
-func (UnimplementedSnowIdServer) GetLayout(context.Context, *GetLayoutRequest) (*GetLayoutResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method GetLayout not implemented")
+func (UnimplementedSnowIdServer) Layout(context.Context, *LayoutRequest) (*LayoutResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Layout not implemented")
 }
 func (UnimplementedSnowIdServer) mustEmbedUnimplementedSnowIdServer() {}
 
@@ -122,20 +128,20 @@ func _SnowId_Next_Handler(srv interface{}, ctx context.Context, dec func(interfa
 	return interceptor(ctx, in, info, handler)
 }
 
-func _SnowId_GetLayout_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(GetLayoutRequest)
+func _SnowId_Layout_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(LayoutRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(SnowIdServer).GetLayout(ctx, in)
+		return srv.(SnowIdServer).Layout(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: "/snowid.v1.SnowId/GetLayout",
+		FullMethod: "/snowid.v1.SnowId/Layout",
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(SnowIdServer).GetLayout(ctx, req.(*GetLayoutRequest))
+		return srv.(SnowIdServer).Layout(ctx, req.(*LayoutRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -152,8 +158,8 @@ var SnowId_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _SnowId_Next_Handler,
 		},
 		{
-			MethodName: "GetLayout",
-			Handler:    _SnowId_GetLayout_Handler,
+			MethodName: "Layout",
+			Handler:    _SnowId_Layout_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

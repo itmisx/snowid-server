@@ -24,7 +24,7 @@ out **unique, roughly time-ordered 64-bit IDs**. No ZooKeeper, no Redis, no data
 ### Try it with Docker
 
 ```bash
-docker run -d -p 50051:50051 \
+docker run -d -p 50052:50052 \
   ghcr.io/itmisx/snowid-server:latest --worker-id 0
 ```
 
@@ -40,23 +40,23 @@ docker run -d -p 50051:50051 \
 ```go
 import "github.com/itmisx/snowid-server/pkg/client"
 
-c, _ := client.New(ctx, "dns:///snowid:50051")
+c, _ := client.New(ctx, "dns:///snowid:50052")
 defer c.Close()
 
 id, _ := c.Next(ctx)          // one
 ids, _ := c.NextN(ctx, 500)   // a batch
 
 // Decoded here, not over the network.
-c.Layout().Time(id)           // when
-c.Layout().Worker(id)         // which machine
-c.Layout().Datacenter(id)     // which datacenter
+c.Layout().Time(id)            // when
+c.Layout().WorkerID(id)        // which machine
+c.Layout().DatacenterID(id)    // which datacenter
 ```
 
 **Any other language** — it is plain gRPC; call the generated stub. Server reflection is
 registered, so `grpcurl` does not even need the `.proto`:
 
 ```console
-$ grpcurl -plaintext -d '{"count": 3}' localhost:50051 snowid.v1.SnowId/Next
+$ grpcurl -plaintext -d '{"count": 3}' localhost:50052 snowid.v1.SnowId/Next
 {
   "ids": [
     "864842698333356032",
@@ -91,7 +91,7 @@ Each pod takes its `worker-id` from its own StatefulSet ordinal — **no externa
 | `--datacenter-bits` | | `0` | How much of it is the datacenter. Worker = `node-bits − datacenter-bits` |
 | `--step-bits` | | `12` | Step segment width → **4096** IDs/ms/worker |
 | `--epoch` | | `1727712000000` | Timestamp zero point, **unix ms** (2024-10-01 UTC+8) |
-| `--addr` | | `:50051` | gRPC listen address |
+| `--addr` | | `:50052` | gRPC listen address |
 
 > [!WARNING]
 > **`--node-bits`, `--datacenter-bits`, `--step-bits` and `--epoch` are permanent.**
@@ -217,13 +217,16 @@ The segments are **Twitter's original snowflake**, and so are their names:
 <br>
 
 **Never decode over the network.** It is a few bit operations; a round trip to read an ID's
-timestamp is pure waste. Call `GetLayout` once for the segment widths, then decode forever:
+timestamp is pure waste. Call `Layout` once for the segment widths, then decode forever. The
+worker width is not sent — it is whatever the node segment has left once the datacenter takes
+its share:
 
 ```python
-unix_milli = (id >> (datacenter_bits + worker_bits + step_bits)) + epoch_unix_milli
-datacenter = (id >> (worker_bits + step_bits)) & ((1 << datacenter_bits) - 1)
-worker     = (id >> step_bits) & ((1 << worker_bits) - 1)
-step       =  id & ((1 << step_bits) - 1)
+worker_bits = node_bits - datacenter_bits
+unix_milli  = (id >> (node_bits + step_bits)) + epoch
+datacenter  = (id >> (worker_bits + step_bits)) & ((1 << datacenter_bits) - 1)
+worker      = (id >> step_bits) & ((1 << worker_bits) - 1)
+step        =  id & ((1 << step_bits) - 1)
 ```
 
 With datacenters off, `datacenter_bits` is 0, so `datacenter` comes out 0 and the worker gets the
@@ -244,7 +247,7 @@ See [`snowid.proto`](api/proto/snowid/v1/snowid.proto). The standard gRPC **heal
 | RPC | Description |
 | :--- | :--- |
 | `Next(count)` | Returns `count` IDs, ascending. Capped at **1000**; more is `INVALID_ARGUMENT` |
-| `GetLayout()` | Returns the epoch and segment widths, so clients can **decode locally** |
+| `Layout()` | Returns the epoch and segment widths, so clients can **decode locally** |
 
 <details>
 <summary><b>📘 The full Go client API</b></summary>

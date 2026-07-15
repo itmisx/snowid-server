@@ -10,27 +10,32 @@ option go_package = "github.com/itmisx/snowid-server/gen/snowid/v1;snowidv1";
 // snowflake did:
 //
 //   | unused(1) | timestamp | datacenter | worker | step |
+//                            \____ node segment ____/
 //
-// The datacenter and worker segments together identify the process that made the
-// ID, and no two live processes may share that pair. datacenter_bits is normally
-// 0, which leaves the whole segment to the worker.
+// The datacenter and worker are one segment split in two — the node segment — and
+// together they identify the process that made the ID; no two live processes may
+// share that pair. datacenter_bits is normally 0, which leaves the whole node
+// segment to the worker.
 //
-// The segment widths and the epoch are set at deploy time; call GetLayout to
-// learn them.
+// The segment widths and the epoch are set at deploy time; call Layout to learn
+// them.
 service SnowId {
   // Next returns `count` unique IDs, in ascending order.
   rpc Next(NextRequest) returns (NextResponse) {}
 
-  // GetLayout returns the ID layout, so a client can decode IDs itself.
+  // Layout returns the ID layout, so a client can decode IDs itself.
   //
   // Decoding is pure bit arithmetic; never call the server to read an ID's
-  // timestamp. Fetch the layout once at startup and decode locally:
+  // timestamp. Fetch the layout once at startup and decode locally. The worker
+  // segment width is derived — the response does not send it — because it is
+  // whatever the node segment has left once the datacenter takes its share:
   //
-  //   unix_milli = (id >> (datacenter_bits + worker_bits + step_bits)) + epoch_unix_milli
-  //   datacenter = (id >> (worker_bits + step_bits)) & ((1 << datacenter_bits) - 1)
-  //   worker     = (id >> step_bits) & ((1 << worker_bits) - 1)
-  //   step       =  id & ((1 << step_bits) - 1)
-  rpc GetLayout(GetLayoutRequest) returns (GetLayoutResponse) {}
+  //   worker_bits = node_bits - datacenter_bits
+  //   unix_milli  = (id >> (node_bits + step_bits)) + epoch
+  //   datacenter  = (id >> (worker_bits + step_bits)) & ((1 << datacenter_bits) - 1)
+  //   worker      = (id >> step_bits) & ((1 << worker_bits) - 1)
+  //   step        =  id & ((1 << step_bits) - 1)
+  rpc Layout(LayoutRequest) returns (LayoutResponse) {}
 }
 
 message NextRequest {
@@ -42,7 +47,7 @@ message NextRequest {
 
 message NextResponse {
   // "node_id" is gone: it said which process made these IDs, and every ID
-  // already carries that — decode it with the layout. See GetLayoutResponse.
+  // already carries that — decode it with the layout. See LayoutResponse.
   reserved 2;
   reserved "node_id";
 
@@ -53,34 +58,33 @@ message NextResponse {
   repeated int64 ids = 1;
 }
 
-message GetLayoutRequest {}
+message LayoutRequest {}
 
-message GetLayoutResponse {
-  // "node_bits" and "node_id" are gone. "node" meant two different things — the
-  // whole datacenter+worker segment, and the worker within a datacenter — which
-  // is exactly the confusion this rename removes. Use worker_bits and worker_id.
-  reserved 2, 4;
-  reserved "node_bits", "node_id";
-
+message LayoutResponse {
   // Zero point of the timestamp segment, in Unix milliseconds.
-  int64 epoch_unix_milli = 1;
+  int64 epoch = 1;
+
+  // Width of the whole node segment, in bits: datacenter and worker together. The
+  // datacenter takes datacenter_bits off its top and the worker gets the rest, so
+  // the worker width is not sent — it is node_bits - datacenter_bits. node_bits +
+  // step_bits is the 22 bits snowflake has for the two, and the timestamp is what
+  // is left.
+  int32 node_bits = 2;
+
+  // How much of the node segment, from its top, is the datacenter. Zero — the
+  // usual case — means there are no datacenters, and datacenter_id is always 0.
+  int32 datacenter_bits = 3;
 
   // Width of the step segment, in bits: how many IDs one worker can issue within
   // one millisecond.
-  int32 step_bits = 3;
+  int32 step_bits = 4;
 
   // The largest `count` Next will accept.
   int32 max_batch = 5;
 
-  // Width of the datacenter segment, in bits. Zero — the usual case — means
-  // there are no datacenters, and datacenter_id is always 0.
-  int32 datacenter_bits = 6;
-
-  // Width of the worker segment, in bits.
-  int32 worker_bits = 7;
-
-  // The datacenter and worker this server runs as. Together they are its
-  // identity, and no two live processes may share it.
-  int64 datacenter_id = 8;
-  int64 worker_id = 9;
+  // The datacenter and worker this server runs as. Together they are its identity,
+  // and no two live processes may share it. worker_id is the worker within its
+  // datacenter.
+  int64 datacenter_id = 6;
+  int64 worker_id = 7;
 }

@@ -53,13 +53,13 @@ func (s *Service) Next(_ context.Context, req *snowidv1.NextRequest) (*snowidv1.
 	return &snowidv1.NextResponse{Ids: ids}, nil
 }
 
-// GetLayout returns the ID layout, so a client can decode IDs locally instead of
+// Layout returns the ID layout, so a client can decode IDs locally instead of
 // asking the server what time an ID was made, or who made it.
-func (s *Service) GetLayout(_ context.Context, _ *snowidv1.GetLayoutRequest) (*snowidv1.GetLayoutResponse, error) {
-	return &snowidv1.GetLayoutResponse{
-		EpochUnixMilli: s.layout.EpochMilli,
+func (s *Service) Layout(_ context.Context, _ *snowidv1.LayoutRequest) (*snowidv1.LayoutResponse, error) {
+	return &snowidv1.LayoutResponse{
+		Epoch:          s.layout.EpochMilli,
+		NodeBits:       int32(s.layout.NodeBits),
 		DatacenterBits: int32(s.layout.DatacenterBits),
-		WorkerBits:     int32(s.layout.WorkerBits),
 		StepBits:       int32(s.layout.StepBits),
 		DatacenterId:   s.datacenterID,
 		WorkerId:       s.workerID,

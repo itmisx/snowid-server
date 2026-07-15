@@ -97,8 +97,8 @@ func (c config) datacenter() int64 {
 func (c config) layout() snowflake.Layout {
 	return snowflake.Layout{
 		EpochMilli:     c.epochMilli,
+		NodeBits:       c.nodeBits,
 		DatacenterBits: c.datacenterBits,
-		WorkerBits:     c.workerBits(),
 		StepBits:       c.stepBits,
 	}
 }
@@ -172,7 +172,7 @@ func run(args []string) error {
 
 	fs := flag.NewFlagSet("snowid-server", flag.ContinueOnError)
 	var (
-		addr = fs.String("addr", ":50051", "gRPC listen address")
+		addr = fs.String("addr", ":50052", "gRPC listen address")
 		// The worker id is the one value that differs from pod to pod, and a manifest
 		// cannot write a different flag per replica — hence the environment. The
 		// datacenter is the opposite: one value for the whole deployment, the same for
@@ -205,7 +205,7 @@ func run(args []string) error {
 	// bwmarrin has one identity segment, not two, and knows nothing of datacenters.
 	// So the pair is packed into that single segment — concatenated, never added;
 	// see Layout.PackID — and bwmarrin's "node" is the result.
-	nodeID := layout.PackID(cfg.datacenter(), cfg.workerID)
+	nodeID := layout.NodeID(cfg.datacenter(), cfg.workerID)
 
 	// bwmarrin keeps the layout in package-level variables, which NewNode reads.
 	bw.Epoch, bw.NodeBits, bw.StepBits = cfg.epochMilli, cfg.nodeBits, cfg.stepBits

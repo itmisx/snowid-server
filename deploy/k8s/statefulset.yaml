@@ -34,7 +34,7 @@ spec:
     app: snowid
   ports:
     - name: grpc
-      port: 50051
+      port: 50052
       targetPort: grpc
 ---
 apiVersion: apps/v1
@@ -106,14 +106,14 @@ spec:
                   fieldPath: metadata.labels['apps.kubernetes.io/pod-index']
           ports:
             - name: grpc
-              containerPort: 50051
+              containerPort: 50052
           readinessProbe:
             grpc:
-              port: 50051
+              port: 50052
             periodSeconds: 5
           livenessProbe:
             grpc:
-              port: 50051
+              port: 50052
             periodSeconds: 10
           resources:
             requests:

@@ -17,7 +17,7 @@ var (
 // put one in.
 func cfg() config {
 	return config{
-		addr:           ":50051",
+		addr:           ":50052",
 		workerID:       0,
 		datacenterID:   -1,
 		nodeBits:       10,

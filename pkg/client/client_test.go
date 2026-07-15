@@ -29,15 +29,15 @@ func newTestServer(t *testing.T) *grpc.ClientConn {
 	// Twitter's 5/5 split, so these tests exercise the datacenter segment.
 	l := snowflake.Layout{
 		EpochMilli:     1577836800000, // 2020-01-01 UTC
+		NodeBits:       10,
 		DatacenterBits: 5,
-		WorkerBits:     5,
 		StepBits:       snowflake.DefaultStepBits,
 	}
 	bw.Epoch = l.EpochMilli
-	bw.NodeBits = l.DatacenterBits + l.WorkerBits
+	bw.NodeBits = l.NodeBits
 	bw.StepBits = l.StepBits
 
-	node, err := bw.NewNode(l.PackID(testDatacenterID, testWorkerID))
+	node, err := bw.NewNode(l.NodeID(testDatacenterID, testWorkerID))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,10 +153,10 @@ func TestLayoutDecodesLocally(t *testing.T) {
 	}
 
 	l := c.Layout()
-	if got := l.Datacenter(id); got != testDatacenterID {
+	if got := l.DatacenterID(id); got != testDatacenterID {
 		t.Errorf("datacenter = %d, want %d", got, testDatacenterID)
 	}
-	if got := l.Worker(id); got != testWorkerID {
+	if got := l.WorkerID(id); got != testWorkerID {
 		t.Errorf("worker = %d, want %d", got, testWorkerID)
 	}
 	if l.Time(id).IsZero() {

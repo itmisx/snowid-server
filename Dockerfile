@@ -28,7 +28,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath \
 # Run
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/snowid-server /snowid-server
-EXPOSE 50051
+EXPOSE 50052
 # 65532 numerically, not the name "nonroot". A username here would break the
 # manifest's runAsNonRoot: kubelet cannot check whether a *name* is root, so it
 # refuses to start the container at all (CreateContainerConfigError).

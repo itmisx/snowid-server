@@ -4,7 +4,7 @@
 // layout once so that IDs can be decoded without a round trip, and calls Next.
 // There is no buffering and no background goroutine — every Next is one RPC.
 //
-//	c, err := client.New(ctx, "dns:///snowid:50051")
+//	c, err := client.New(ctx, "dns:///snowid:50052")
 //	defer c.Close()
 //
 //	id, err := c.Next(ctx)
@@ -85,14 +85,14 @@ func NewWithConn(ctx context.Context, conn *grpc.ClientConn) (*Client, error) {
 func newWithConn(ctx context.Context, conn *grpc.ClientConn) (*Client, error) {
 	c := &Client{conn: conn, rpc: snowidv1.NewSnowIdClient(conn)}
 
-	l, err := c.rpc.GetLayout(ctx, &snowidv1.GetLayoutRequest{}, grpc.WaitForReady(true))
+	l, err := c.rpc.Layout(ctx, &snowidv1.LayoutRequest{}, grpc.WaitForReady(true))
 	if err != nil {
 		return nil, fmt.Errorf("snowid: get layout: %w", err)
 	}
 	c.layout = snowflake.Layout{
-		EpochMilli:     l.GetEpochUnixMilli(),
+		EpochMilli:     l.GetEpoch(),
+		NodeBits:       uint8(l.GetNodeBits()),
 		DatacenterBits: uint8(l.GetDatacenterBits()),
-		WorkerBits:     uint8(l.GetWorkerBits()),
 		StepBits:       uint8(l.GetStepBits()),
 	}
 	c.datacenterID = l.GetDatacenterId()
@@ -108,8 +108,8 @@ func newWithConn(ctx context.Context, conn *grpc.ClientConn) (*Client, error) {
 // rather than over the network:
 //
 //	c.Layout().Time(id)
-//	c.Layout().Datacenter(id)
-//	c.Layout().Worker(id)
+//	c.Layout().DatacenterID(id)
+//	c.Layout().WorkerID(id)
 //
 // It is fetched once, on connect. The layout is permanent, so it cannot go stale.
 func (c *Client) Layout() snowflake.Layout { return c.layout }

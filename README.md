@@ -24,7 +24,7 @@
 ### 用 Docker 跑起来
 
 ```bash
-docker run -d -p 50051:50051 \
+docker run -d -p 50052:50052 \
   ghcr.io/itmisx/snowid-server:latest --worker-id 0
 ```
 
@@ -40,23 +40,23 @@ docker run -d -p 50051:50051 \
 ```go
 import "github.com/itmisx/snowid-server/pkg/client"
 
-c, _ := client.New(ctx, "dns:///snowid:50051")
+c, _ := client.New(ctx, "dns:///snowid:50052")
 defer c.Close()
 
 id, _ := c.Next(ctx)          // 一个
 ids, _ := c.NextN(ctx, 500)   // 一批
 
 // 解码在本地，不走网络
-c.Layout().Time(id)           // 生成时刻
-c.Layout().Worker(id)         // 哪台机器
-c.Layout().Datacenter(id)     // 哪个机房
+c.Layout().Time(id)            // 生成时刻
+c.Layout().WorkerID(id)        // 哪台机器
+c.Layout().DatacenterID(id)    // 哪个机房
 ```
 
 **其它语言** —— 就是普通的 gRPC，用生成的 stub 调即可。服务端注册了 reflection，所以
 `grpcurl` 连 `.proto` 都不用带：
 
 ```console
-$ grpcurl -plaintext -d '{"count": 3}' localhost:50051 snowid.v1.SnowId/Next
+$ grpcurl -plaintext -d '{"count": 3}' localhost:50052 snowid.v1.SnowId/Next
 {
   "ids": [
     "864842698333356032",
@@ -90,7 +90,7 @@ kubectl apply -f https://raw.githubusercontent.com/itmisx/snowid-server/main/dep
 | `--datacenter-bits` | | `0` | node 段里有几位是机房。机器段 = `node-bits − datacenter-bits` |
 | `--step-bits` | | `12` | 序号段宽度 → 每机器每毫秒 **4096** 个 ID |
 | `--epoch` | | `1727712000000` | 时间戳零点，**Unix 毫秒**（2024-10-01 UTC+8） |
-| `--addr` | | `:50051` | gRPC 监听地址 |
+| `--addr` | | `:50052` | gRPC 监听地址 |
 
 > [!WARNING]
 > **`--node-bits`、`--datacenter-bits`、`--step-bits`、`--epoch` 是永久性的。**
@@ -210,13 +210,15 @@ ERROR startup failed error="--worker-id=32 is out of range [0,31]: --node-bits(1
 <br>
 
 **解码不要走网络。** 只是几次位运算；为了读一个 ID 的时间戳而发起一次往返纯属浪费。
-调一次 `GetLayout` 拿到各段宽度，之后永远本地算：
+调一次 `Layout` 拿到各段宽度，之后永远本地算。机器段宽度不用服务端给——它就是 node 段
+减去机房段剩下的：
 
 ```python
-unix_milli = (id >> (datacenter_bits + worker_bits + step_bits)) + epoch_unix_milli
-datacenter = (id >> (worker_bits + step_bits)) & ((1 << datacenter_bits) - 1)
-worker     = (id >> step_bits) & ((1 << worker_bits) - 1)
-step       =  id & ((1 << step_bits) - 1)
+worker_bits = node_bits - datacenter_bits
+unix_milli  = (id >> (node_bits + step_bits)) + epoch
+datacenter  = (id >> (worker_bits + step_bits)) & ((1 << datacenter_bits) - 1)
+worker      = (id >> step_bits) & ((1 << worker_bits) - 1)
+step        =  id & ((1 << step_bits) - 1)
 ```
 
 不分机房时 `datacenter_bits = 0`，上式里 `datacenter` 恒为 0，机器段拿到全部宽度
@@ -237,7 +239,7 @@ step       =  id & ((1 << step_bits) - 1)
 | RPC | 说明 |
 | :--- | :--- |
 | `Next(count)` | 返回 `count` 个 ID，升序。上限 **1000**，超过返回 `INVALID_ARGUMENT` |
-| `GetLayout()` | 返回 epoch 和各段宽度，供客户端**本地解码** |
+| `Layout()` | 返回 epoch 和各段宽度，供客户端**本地解码** |
 
 <details>
 <summary><b>📘 Go 客户端完整 API</b></summary>

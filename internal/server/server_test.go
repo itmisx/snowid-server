@@ -17,8 +17,8 @@ import (
 func testLayout() snowflake.Layout {
 	return snowflake.Layout{
 		EpochMilli:     1577836800000, // 2020-01-01 UTC
+		NodeBits:       10,
 		DatacenterBits: 5,
-		WorkerBits:     5,
 		StepBits:       snowflake.DefaultStepBits,
 	}
 }
@@ -28,10 +28,10 @@ func newService(t *testing.T, datacenterID, workerID int64) *Service {
 
 	l := testLayout()
 	bw.Epoch = l.EpochMilli
-	bw.NodeBits = l.DatacenterBits + l.WorkerBits
+	bw.NodeBits = l.NodeBits
 	bw.StepBits = l.StepBits
 
-	node, err := bw.NewNode(l.PackID(datacenterID, workerID))
+	node, err := bw.NewNode(l.NodeID(datacenterID, workerID))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,10 +64,10 @@ func TestNextIsUniqueAndAscending(t *testing.T) {
 		if id <= 0 {
 			t.Fatalf("id %d is not positive; the sign bit must stay clear", id)
 		}
-		if got := l.Datacenter(snowflake.ID(id)); got != 1 {
+		if got := l.DatacenterID(snowflake.ID(id)); got != 1 {
 			t.Fatalf("id %d carries datacenter %d, want 1", id, got)
 		}
-		if got := l.Worker(snowflake.ID(id)); got != 2 {
+		if got := l.WorkerID(snowflake.ID(id)); got != 2 {
 			t.Fatalf("id %d carries worker %d, want 2", id, got)
 		}
 	}
@@ -125,19 +125,19 @@ func TestNextRejectsAnOversizedBatch(t *testing.T) {
 	}
 }
 
-// Clients decode ids with what GetLayout tells them, so it has to describe the
+// Clients decode ids with what Layout tells them, so it has to describe the
 // generator that is actually running.
-func TestGetLayoutDescribesTheRunningGenerator(t *testing.T) {
+func TestLayoutDescribesTheRunningGenerator(t *testing.T) {
 	svc := newService(t, 1, 2)
 	want := testLayout()
 
-	resp, err := svc.GetLayout(context.Background(), &snowidv1.GetLayoutRequest{})
+	resp, err := svc.Layout(context.Background(), &snowidv1.LayoutRequest{})
 	if err != nil {
-		t.Fatalf("GetLayout: %v", err)
+		t.Fatalf("Layout: %v", err)
 	}
-	if resp.GetEpochUnixMilli() != want.EpochMilli ||
+	if resp.GetEpoch() != want.EpochMilli ||
+		resp.GetNodeBits() != int32(want.NodeBits) ||
 		resp.GetDatacenterBits() != int32(want.DatacenterBits) ||
-		resp.GetWorkerBits() != int32(want.WorkerBits) ||
 		resp.GetStepBits() != int32(want.StepBits) {
 		t.Fatalf("layout = %+v, want %+v", resp, want)
 	}
@@ -154,16 +154,16 @@ func TestGetLayoutDescribesTheRunningGenerator(t *testing.T) {
 		t.Fatal(err)
 	}
 	reported := snowflake.Layout{
-		EpochMilli:     resp.GetEpochUnixMilli(),
+		EpochMilli:     resp.GetEpoch(),
+		NodeBits:       uint8(resp.GetNodeBits()),
 		DatacenterBits: uint8(resp.GetDatacenterBits()),
-		WorkerBits:     uint8(resp.GetWorkerBits()),
 		StepBits:       uint8(resp.GetStepBits()),
 	}
 	id := snowflake.ID(next.GetIds()[0])
-	if got := reported.Datacenter(id); got != 1 {
+	if got := reported.DatacenterID(id); got != 1 {
 		t.Fatalf("decoding with the reported layout gives datacenter %d, want 1", got)
 	}
-	if got := reported.Worker(id); got != 2 {
+	if got := reported.WorkerID(id); got != 2 {
 		t.Fatalf("decoding with the reported layout gives worker %d, want 2", got)
 	}
 }
